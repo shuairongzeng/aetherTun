@@ -7,6 +7,8 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"sync"
+	"time"
 
 	"github.com/shuairongzeng/aether/internal/config"
 	"github.com/shuairongzeng/aether/internal/dns"
@@ -27,35 +29,54 @@ import (
 )
 
 const (
-	defaultMTU      = 9000
-	tcpQueueSize    = 512
-	tcpMaxInFlight  = 1024
-	tcpReceiveWnd   = 0 // 0 = gVisor 默认
+	defaultMTU     = 9000
+	tcpQueueSize   = 512
+	tcpMaxInFlight = 1024
+	tcpReceiveWnd  = 0 // 0 = gVisor 默认
+	udpTimeout     = 60 * time.Second
+	udpBufSize     = 65536
 )
 
+// udpSessionKey 标识一条 UDP 会话（四元组）
+type udpSessionKey struct {
+	srcAddr string // srcIP:srcPort
+	dstAddr string // dstIP:dstPort
+}
+
+// udpSession 代表一个活跃的 UDP 中继会话
+type udpSession struct {
+	appConn  *gonet.UDPConn    // gVisor 侧：与应用通信
+	cancel   context.CancelFunc
+	lastSeen time.Time
+}
+
 type Engine struct {
-	cfg        *config.Config
-	adapter    *wintun.Adapter
-	session    wintun.Session
-	sessionOK  bool
-	netStack   *stack.Stack
-	linkEP     *channel.Endpoint
-	dnsServer  *dns.Server
-	router     *routing.Engine
-	socks5     *proxy.Socks5Client
-	ctx        context.Context
-	cancel     context.CancelFunc
+	cfg       *config.Config
+	adapter   *wintun.Adapter
+	session   wintun.Session
+	sessionOK bool
+	netStack  *stack.Stack
+	linkEP    *channel.Endpoint
+	dnsServer *dns.Server
+	router    *routing.Engine
+	socks5    *proxy.Socks5Client
+	ctx       context.Context
+	cancel    context.CancelFunc
+
+	udpMu       sync.Mutex
+	udpSessions map[udpSessionKey]*udpSession
 }
 
 func New(cfg *config.Config, dnsServer *dns.Server, router *routing.Engine) *Engine {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Engine{
-		cfg:       cfg,
-		dnsServer: dnsServer,
-		router:    router,
-		socks5:    proxy.NewSocks5Client(cfg.Proxy.Host, cfg.Proxy.Port),
-		ctx:       ctx,
-		cancel:    cancel,
+		cfg:         cfg,
+		dnsServer:   dnsServer,
+		router:      router,
+		socks5:      proxy.NewSocks5Client(cfg.Proxy.Host, cfg.Proxy.Port),
+		ctx:         ctx,
+		cancel:      cancel,
+		udpSessions: make(map[udpSessionKey]*udpSession),
 	}
 }
 
@@ -91,7 +112,14 @@ func (e *Engine) Start() error {
 	tcpFwd := tcp.NewForwarder(e.netStack, tcpReceiveWnd, tcpMaxInFlight, e.handleTCPConn)
 	e.netStack.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpFwd.HandlePacket)
 
-	// 4. 启动 wintun ↔ gVisor 数据泵
+	// 4. 注册 UDP forwarder
+	udpFwd := udp.NewForwarder(e.netStack, e.handleUDPPacket)
+	e.netStack.SetTransportProtocolHandler(udp.ProtocolNumber, udpFwd.HandlePacket)
+
+	// 5. 启动 UDP session 过期清理
+	go e.cleanupUDPSessions()
+
+	// 6. 启动 wintun ↔ gVisor 数据泵
 	go e.readFromTUN()
 	go e.writeToTUN()
 
@@ -257,7 +285,7 @@ func (e *Engine) handleTCPConn(r *tcp.ForwarderRequest) {
 	case routing.ActionDirect:
 		log.Printf("[TCP] DIRECT %s:%d", targetHost, dstPort)
 		go e.relayConcurrent(appConn, func() (net.Conn, error) {
-			return net.Dial("tcp", fmt.Sprintf("%s:%d", targetHost, dstPort))
+			return net.Dial("tcp", net.JoinHostPort(targetHost, fmt.Sprintf("%d", dstPort)))
 		})
 	default: // proxy
 		log.Printf("[TCP] PROXY  %s:%d", targetHost, dstPort)
@@ -300,4 +328,198 @@ func (e *Engine) relayConcurrent(appConn *gonet.TCPConn, dial func() (net.Conn, 
 	// 等两个方向都结束
 	<-done
 	<-done
+}
+
+// ─── UDP ──────────────────────────────────────────────────────────────────────
+
+// handleUDPPacket 是 udp.Forwarder 的回调，每个新 UDP 四元组触发一次
+func (e *Engine) handleUDPPacket(r *udp.ForwarderRequest) (handled bool) {
+	id := r.ID()
+	dstIP := net.IP(id.LocalAddress.AsSlice())
+	dstPort := id.LocalPort
+	srcKey := net.JoinHostPort(id.RemoteAddress.String(), fmt.Sprintf("%d", id.RemotePort))
+	dstKey := net.JoinHostPort(id.LocalAddress.String(), fmt.Sprintf("%d", dstPort))
+	key := udpSessionKey{srcAddr: srcKey, dstAddr: dstKey}
+
+	// FakeIP → 还原真实域名
+	targetHost := dstIP.String()
+	if domain, ok := e.dnsServer.FakeIPMap().LookupDomain(dstIP); ok {
+		targetHost = domain
+	}
+
+	// 路由决策
+	action := e.router.Match(dstIP, targetHost, "")
+	if action == routing.ActionBlock {
+		log.Printf("[UDP] BLOCK  %s:%d", targetHost, dstPort)
+		return false
+	}
+
+	// 查找已有 session
+	e.udpMu.Lock()
+	sess, exists := e.udpSessions[key]
+	if exists {
+		sess.lastSeen = time.Now()
+		e.udpMu.Unlock()
+		// session 已存在，ForwarderRequest 会自动把包注入已有 endpoint
+		return true
+	}
+
+	// 新建 session
+	wq := new(waiter.Queue)
+	ep, tcpipErr := r.CreateEndpoint(wq)
+	if tcpipErr != nil {
+		e.udpMu.Unlock()
+		log.Printf("[UDP] 创建端点失败 %s:%d: %v", targetHost, dstPort, tcpipErr)
+		return false
+	}
+
+	ctx, cancel := context.WithCancel(e.ctx)
+	appConn := gonet.NewUDPConn(wq, ep)
+	sess = &udpSession{
+		appConn:  appConn,
+		cancel:   cancel,
+		lastSeen: time.Now(),
+	}
+	e.udpSessions[key] = sess
+	e.udpMu.Unlock()
+
+	switch action {
+	case routing.ActionDirect:
+		log.Printf("[UDP] DIRECT %s:%d", targetHost, dstPort)
+		go e.relayUDPDirect(ctx, key, appConn, targetHost, dstPort)
+	default:
+		log.Printf("[UDP] PROXY  %s:%d", targetHost, dstPort)
+		go e.relayUDPProxy(ctx, key, appConn, targetHost, dstPort)
+	}
+	return true
+}
+
+// relayUDPDirect 通过真实 UDP socket 直连转发
+func (e *Engine) relayUDPDirect(ctx context.Context, key udpSessionKey, appConn *gonet.UDPConn, host string, port uint16) {
+	defer e.removeUDPSession(key)
+	defer appConn.Close()
+
+	outConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	if err != nil {
+		log.Printf("[UDP] 创建出站 socket 失败: %v", err)
+		return
+	}
+	defer outConn.Close()
+
+	dstAddr := &net.UDPAddr{IP: net.ParseIP(host), Port: int(port)}
+	buf := make([]byte, udpBufSize)
+
+	// app → out（每次 Read 是一个完整 datagram）
+	go func() {
+		pkt := make([]byte, udpBufSize)
+		for {
+			n, _, err := appConn.ReadFrom(pkt)
+			if err != nil {
+				return
+			}
+			outConn.SetWriteDeadline(time.Now().Add(udpTimeout))
+			outConn.WriteTo(pkt[:n], dstAddr)
+		}
+	}()
+
+	// out → app
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		outConn.SetReadDeadline(time.Now().Add(udpTimeout))
+		n, _, err := outConn.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+		appConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		appConn.WriteTo(buf[:n], nil)
+		e.touchUDPSession(key)
+	}
+}
+
+// relayUDPProxy 通过 SOCKS5 UDP ASSOCIATE 转发
+func (e *Engine) relayUDPProxy(ctx context.Context, key udpSessionKey, appConn *gonet.UDPConn, host string, port uint16) {
+	defer e.removeUDPSession(key)
+	defer appConn.Close()
+
+	udpSess, err := e.socks5.UDPAssociate()
+	if err != nil {
+		log.Printf("[UDP] SOCKS5 UDP ASSOCIATE 失败 %s:%d: %v", host, port, err)
+		return
+	}
+	defer udpSess.Close()
+
+	buf := make([]byte, udpBufSize)
+
+	// app → proxy relay
+	go func() {
+		pkt := make([]byte, udpBufSize)
+		for {
+			n, _, err := appConn.ReadFrom(pkt)
+			if err != nil {
+				return
+			}
+			udpSess.UDPConn.SetWriteDeadline(time.Now().Add(udpTimeout))
+			if err := udpSess.SendUDP(pkt[:n], host, port); err != nil {
+				log.Printf("[UDP] 发送到代理失败: %v", err)
+				return
+			}
+		}
+	}()
+
+	// proxy relay → app
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		udpSess.UDPConn.SetReadDeadline(time.Now().Add(udpTimeout))
+		payload, _, _, err := udpSess.RecvUDP(buf)
+		if err != nil {
+			return
+		}
+		appConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		appConn.WriteTo(payload, nil)
+		e.touchUDPSession(key)
+	}
+}
+
+func (e *Engine) removeUDPSession(key udpSessionKey) {
+	e.udpMu.Lock()
+	delete(e.udpSessions, key)
+	e.udpMu.Unlock()
+}
+
+func (e *Engine) touchUDPSession(key udpSessionKey) {
+	e.udpMu.Lock()
+	if sess, ok := e.udpSessions[key]; ok {
+		sess.lastSeen = time.Now()
+	}
+	e.udpMu.Unlock()
+}
+
+// cleanupUDPSessions 定期清理超时的 UDP 会话
+func (e *Engine) cleanupUDPSessions() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-e.ctx.Done():
+			return
+		case <-ticker.C:
+			now := time.Now()
+			e.udpMu.Lock()
+			for key, sess := range e.udpSessions {
+				if now.Sub(sess.lastSeen) > udpTimeout {
+					sess.cancel()
+					delete(e.udpSessions, key)
+				}
+			}
+			e.udpMu.Unlock()
+		}
+	}
 }
