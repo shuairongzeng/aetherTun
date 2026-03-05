@@ -1,0 +1,5 @@
+aether.exe
+*.exe
+config.json
+logs/
+.beads/
