@@ -27,21 +27,24 @@ import (
 )
 
 const (
-	defaultMTU   = 9000
-	tcpQueueSize = 32
+	defaultMTU      = 9000
+	tcpQueueSize    = 512
+	tcpMaxInFlight  = 1024
+	tcpReceiveWnd   = 0 // 0 = gVisor 默认
 )
 
 type Engine struct {
-	cfg       *config.Config
-	adapter   *wintun.Adapter
-	session   wintun.Session
-	stack     *stack.Stack
-	linkEP    *channel.Endpoint
-	dnsServer *dns.Server
-	router    *routing.Engine
-	socks5    *proxy.Socks5Client
-	ctx       context.Context
-	cancel    context.CancelFunc
+	cfg        *config.Config
+	adapter    *wintun.Adapter
+	session    wintun.Session
+	sessionOK  bool
+	netStack   *stack.Stack
+	linkEP     *channel.Endpoint
+	dnsServer  *dns.Server
+	router     *routing.Engine
+	socks5     *proxy.Socks5Client
+	ctx        context.Context
+	cancel     context.CancelFunc
 }
 
 func New(cfg *config.Config, dnsServer *dns.Server, router *routing.Engine) *Engine {
@@ -57,58 +60,64 @@ func New(cfg *config.Config, dnsServer *dns.Server, router *routing.Engine) *Eng
 }
 
 func (e *Engine) Start() error {
-	tunCfg := e.cfg.Tun
-	mtu := tunCfg.MTU
+	mtu := e.cfg.Tun.MTU
 	if mtu == 0 {
 		mtu = defaultMTU
 	}
 
-	// 创建 wintun 适配器
-	adapter, err := wintun.CreateAdapter(tunCfg.AdapterName, "Wintun", nil)
+	// 1. 创建 wintun 适配器
+	adapter, err := wintun.CreateAdapter(e.cfg.Tun.AdapterName, "Wintun", nil)
 	if err != nil {
 		return fmt.Errorf("创建 TUN 适配器失败: %w", err)
 	}
 	e.adapter = adapter
 
-	session, err := adapter.StartSession(0x800000) // 8MB 环形缓冲
+	session, err := adapter.StartSession(0x800000) // 8MB ring buffer
 	if err != nil {
 		adapter.Close()
 		return fmt.Errorf("启动 wintun 会话失败: %w", err)
 	}
 	e.session = session
+	e.sessionOK = true
 
-	// 初始化 gVisor 网络栈
+	// 2. 初始化 gVisor 网络栈
 	if err := e.initStack(mtu); err != nil {
-		session.End()
-		adapter.Close()
+		e.session.End()
+		e.adapter.Close()
 		return err
 	}
 
-	// 启动读写协程
+	// 3. 注册 TCP forwarder（正确的连接级拦截方式）
+	tcpFwd := tcp.NewForwarder(e.netStack, tcpReceiveWnd, tcpMaxInFlight, e.handleTCPConn)
+	e.netStack.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpFwd.HandlePacket)
+
+	// 4. 启动 wintun ↔ gVisor 数据泵
 	go e.readFromTUN()
 	go e.writeToTUN()
 
-	// 注册 TCP handler
-	e.stack.SetTransportProtocolHandler(tcp.ProtocolNumber, e.handleTCP)
-
-	fmt.Printf("[TUN] 适配器 %s 已启动 (MTU=%d)\n", tunCfg.AdapterName, mtu)
+	log.Printf("[TUN] 启动成功: 适配器=%s MTU=%d 代理=%s:%d",
+		e.cfg.Tun.AdapterName, mtu, e.cfg.Proxy.Host, e.cfg.Proxy.Port)
 	return nil
 }
 
 func (e *Engine) Stop() {
 	e.cancel()
-	if e.session != (wintun.Session{}) {
+	if e.sessionOK {
 		e.session.End()
+		e.sessionOK = false
 	}
 	if e.adapter != nil {
 		e.adapter.Close()
+		e.adapter = nil
 	}
-	if e.stack != nil {
-		e.stack.Close()
+	if e.netStack != nil {
+		e.netStack.Close()
+		e.netStack = nil
 	}
-	fmt.Println("[TUN] 已停止")
+	log.Println("[TUN] 已停止")
 }
 
+// initStack 初始化 gVisor TCP/IP 协议栈
 func (e *Engine) initStack(mtu uint32) error {
 	e.linkEP = channel.New(tcpQueueSize, mtu, "")
 
@@ -122,41 +131,48 @@ func (e *Engine) initStack(mtu uint32) error {
 			udp.NewProtocol,
 		},
 	})
-	e.stack = s
+	e.netStack = s
 
-	const nicID = 1
-	if err := s.CreateNIC(nicID, e.linkEP); err != nil {
-		return fmt.Errorf("创建 NIC 失败: %v", err)
+	const nicID tcpip.NICID = 1
+	if tcpipErr := s.CreateNIC(nicID, e.linkEP); tcpipErr != nil {
+		return fmt.Errorf("创建 NIC 失败: %v", tcpipErr)
 	}
 
-	// 添加 TUN 接口地址
+	// 绑定 TUN 接口 IP 地址
 	prefix, err := netip.ParsePrefix(e.cfg.Tun.Address)
 	if err != nil {
 		return fmt.Errorf("解析 TUN 地址失败: %w", err)
 	}
 	as4 := prefix.Addr().As4()
-	addr := tcpip.AddrFromSlice(as4[:])
-	s.AddProtocolAddress(nicID, tcpip.ProtocolAddress{
+	tcpipAddr := tcpip.AddrFromSlice(as4[:])
+	if tcpipErr := s.AddProtocolAddress(nicID, tcpip.ProtocolAddress{
 		Protocol: ipv4.ProtocolNumber,
 		AddressWithPrefix: tcpip.AddressWithPrefix{
-			Address:   addr,
+			Address:   tcpipAddr,
 			PrefixLen: prefix.Bits(),
 		},
-	}, stack.AddressProperties{})
+	}, stack.AddressProperties{}); tcpipErr != nil {
+		return fmt.Errorf("绑定 NIC 地址失败: %v", tcpipErr)
+	}
 
-	// 默认路由，所有流量进 TUN
+	// 默认路由：所有 IP 包都走 TUN NIC
 	s.SetRouteTable([]tcpip.Route{
 		{Destination: header.IPv4EmptySubnet, NIC: nicID},
 		{Destination: header.IPv6EmptySubnet, NIC: nicID},
 	})
 
-	s.SetPromiscuousMode(nicID, true)
-	s.SetSpoofing(nicID, true)
+	// 混杂模式 + spoofing：接受所有目标 IP 的包（透明代理必须）
+	if tcpipErr := s.SetPromiscuousMode(nicID, true); tcpipErr != nil {
+		return fmt.Errorf("设置混杂模式失败: %v", tcpipErr)
+	}
+	if tcpipErr := s.SetSpoofing(nicID, true); tcpipErr != nil {
+		return fmt.Errorf("设置 spoofing 失败: %v", tcpipErr)
+	}
 
 	return nil
 }
 
-// readFromTUN 从 wintun 读取 IP 包注入 gVisor
+// readFromTUN 从 wintun 读取原始 IP 包，注入 gVisor 协议栈
 func (e *Engine) readFromTUN() {
 	for {
 		select {
@@ -181,106 +197,107 @@ func (e *Engine) readFromTUN() {
 	}
 }
 
-// writeToTUN 从 gVisor 取出 IP 包写入 wintun
+// writeToTUN 从 gVisor 取出出站 IP 包，写回 wintun（发给应用）
 func (e *Engine) writeToTUN() {
 	for {
-		pkt := e.linkEP.ReadContext(e.ctx)
-		if pkt == nil {
-			return
+		pkb := e.linkEP.ReadContext(e.ctx)
+		if pkb == nil {
+			return // ctx cancelled
 		}
 
-		view := pkt.ToView()
+		view := pkb.ToView()
 		data := view.AsSlice()
-		sendPkt, err := e.session.AllocateSendPacket(len(data))
-		if err != nil {
-			view.Release()
-			pkt.DecRef()
-			continue
+		if len(data) > 0 {
+			sendBuf, err := e.session.AllocateSendPacket(len(data))
+			if err == nil {
+				copy(sendBuf, data)
+				e.session.SendPacket(sendBuf)
+			}
 		}
-		copy(sendPkt, data)
-		e.session.SendPacket(sendPkt)
 		view.Release()
-		pkt.DecRef()
+		pkb.DecRef()
 	}
 }
 
-// handleTCP 处理 gVisor 捕获的 TCP 连接
-func (e *Engine) handleTCP(id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
+// handleTCPConn 是 tcp.Forwarder 的回调：每个新 TCP 连接调用一次
+// 此时三次握手尚未完成，调用 r.CreateEndpoint 后握手才完成
+func (e *Engine) handleTCPConn(r *tcp.ForwarderRequest) {
+	id := r.ID()
 	dstIP := net.IP(id.LocalAddress.AsSlice())
 	dstPort := id.LocalPort
 
-	// 查询 FakeIP 还原域名
-	var targetHost string
-	var fakeIPMap = e.dnsServer.FakeIPMap()
-	if domain, ok := fakeIPMap.LookupDomain(dstIP); ok {
+	// FakeIP → 还原真实域名
+	targetHost := dstIP.String()
+	if domain, ok := e.dnsServer.FakeIPMap().LookupDomain(dstIP); ok {
 		targetHost = domain
-	} else {
-		targetHost = dstIP.String()
 	}
 
 	// 路由决策
 	action := e.router.Match(dstIP, targetHost, "")
+
+	if action == routing.ActionBlock {
+		log.Printf("[TCP] BLOCK  %s:%d", targetHost, dstPort)
+		r.Complete(true) // 发 RST，拒绝连接
+		return
+	}
+
+	// 完成三次握手，建立 gVisor 端的 TCP 连接（gonet.TCPConn）
+	wq := new(waiter.Queue)
+	ep, tcpipErr := r.CreateEndpoint(wq)
+	if tcpipErr != nil {
+		log.Printf("[TCP] 建立端点失败 %s:%d: %v", targetHost, dstPort, tcpipErr)
+		r.Complete(true)
+		return
+	}
+	r.Complete(false)
+
+	appConn := gonet.NewTCPConn(wq, ep)
+
 	switch action {
-	case routing.ActionBlock:
-		log.Printf("[TCP] BLOCK %s:%d", targetHost, dstPort)
-		return false
 	case routing.ActionDirect:
 		log.Printf("[TCP] DIRECT %s:%d", targetHost, dstPort)
-		go e.relayTCPDirect(id, pkt, targetHost, dstPort)
-		return true
+		go e.relayConcurrent(appConn, func() (net.Conn, error) {
+			return net.Dial("tcp", fmt.Sprintf("%s:%d", targetHost, dstPort))
+		})
 	default: // proxy
-		log.Printf("[TCP] PROXY %s:%d", targetHost, dstPort)
-		go e.relayTCPProxy(id, pkt, targetHost, dstPort)
-		return true
+		log.Printf("[TCP] PROXY  %s:%d", targetHost, dstPort)
+		go e.relayConcurrent(appConn, func() (net.Conn, error) {
+			return e.socks5.Connect(targetHost, dstPort)
+		})
 	}
 }
 
-func (e *Engine) relayTCPProxy(id stack.TransportEndpointID, pkt *stack.PacketBuffer, host string, port uint16) {
-	wq := new(waiter.Queue)
-	ep, tcpipErr := e.stack.NewEndpoint(tcp.ProtocolNumber, ipv4.ProtocolNumber, wq)
-	if tcpipErr != nil {
-		log.Printf("[TCP] 创建端点失败: %v", tcpipErr)
-		return
-	}
-	defer ep.Close()
+// relayConcurrent 建立出站连接后双向转发数据
+func (e *Engine) relayConcurrent(appConn *gonet.TCPConn, dial func() (net.Conn, error)) {
+	defer appConn.Close()
 
-	conn := gonet.NewTCPConn(wq, ep)
-	defer conn.Close()
-
-	proxyConn, err := e.socks5.Connect(host, port)
+	outConn, err := dial()
 	if err != nil {
-		log.Printf("[TCP] SOCKS5 连接失败 %s:%d: %v", host, port, err)
+		log.Printf("[TCP] 出站连接失败: %v", err)
 		return
 	}
-	defer proxyConn.Close()
+	defer outConn.Close()
 
-	relay(conn, proxyConn)
-}
-
-func (e *Engine) relayTCPDirect(id stack.TransportEndpointID, pkt *stack.PacketBuffer, host string, port uint16) {
-	wq := new(waiter.Queue)
-	ep, tcpipErr := e.stack.NewEndpoint(tcp.ProtocolNumber, ipv4.ProtocolNumber, wq)
-	if tcpipErr != nil {
-		return
-	}
-	defer ep.Close()
-
-	conn := gonet.NewTCPConn(wq, ep)
-	defer conn.Close()
-
-	target, err := net.Dial("tcp", fmt.Sprintf("%s:%d", host, port))
-	if err != nil {
-		log.Printf("[TCP] 直连失败 %s:%d: %v", host, port, err)
-		return
-	}
-	defer target.Close()
-
-	relay(conn, target)
-}
-
-func relay(a, b io.ReadWriter) {
 	done := make(chan struct{}, 2)
-	go func() { io.Copy(a, b); done <- struct{}{} }()
-	go func() { io.Copy(b, a); done <- struct{}{} }()
+
+	// app → out
+	go func() {
+		io.Copy(outConn, appConn)
+		// 半关闭：通知对端写完了
+		if tc, ok := outConn.(*net.TCPConn); ok {
+			tc.CloseWrite()
+		}
+		done <- struct{}{}
+	}()
+
+	// out → app
+	go func() {
+		io.Copy(appConn, outConn)
+		appConn.CloseWrite()
+		done <- struct{}{}
+	}()
+
+	// 等两个方向都结束
+	<-done
 	<-done
 }
