@@ -80,8 +80,9 @@ func (e *Engine) matchRule(rule config.Rule, ip net.IP, domain, process string) 
 		}
 		pattern := rule.Match
 		if strings.HasPrefix(pattern, "*.") {
+			// *.example.com 只匹配子域名（sub.example.com），不匹配 example.com 本身
 			suffix := pattern[1:] // ".example.com"
-			return strings.HasSuffix(domain, suffix) || domain == pattern[2:]
+			return strings.HasSuffix(domain, suffix)
 		}
 		return domain == pattern
 
