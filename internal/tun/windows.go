@@ -3,13 +3,49 @@
 package tun
 
 import (
+	"encoding/binary"
 	"fmt"
 	"net"
 	"net/netip"
 	"os/exec"
 	"strings"
+	"syscall"
 	"time"
+	"unsafe"
 )
+
+const ipUnicastIF = 31 // IP_UNICAST_IF socket option
+
+// getDefaultInterfaceIndex returns the OS interface index used for public
+// traffic. Must be called BEFORE TUN routes override the default route.
+func getDefaultInterfaceIndex() uint32 {
+	proc := modIphlpapi.NewProc("GetBestInterface")
+	var dst uint32 = 0x01010101 // 1.1.1.1
+	var ifIdx uint32
+	ret, _, _ := proc.Call(uintptr(dst), uintptr(unsafe.Pointer(&ifIdx)))
+	if ret != 0 {
+		return 0
+	}
+	return ifIdx
+}
+
+// protectSocket sets IP_UNICAST_IF on the socket so outbound traffic from
+// aether.exe bypasses the TUN adapter and goes through the physical NIC.
+func (e *Engine) protectSocket(network, address string, c syscall.RawConn) error {
+	if e.defaultIfIndex == 0 {
+		return nil
+	}
+	var sockErr error
+	if err := c.Control(func(fd uintptr) {
+		var buf [4]byte
+		binary.BigEndian.PutUint32(buf[:], e.defaultIfIndex)
+		nbo := *(*uint32)(unsafe.Pointer(&buf[0]))
+		sockErr = syscall.SetsockoptInt(syscall.Handle(fd), syscall.IPPROTO_IP, ipUnicastIF, int(nbo))
+	}); err != nil {
+		return err
+	}
+	return sockErr
+}
 
 // configureWindowsAdapter 為 wintun 適配器分配 IP，並（若啟用）配置系統路由和 DNS
 func (e *Engine) configureWindowsAdapter() error {

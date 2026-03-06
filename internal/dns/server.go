@@ -76,6 +76,11 @@ func (s *Server) FakeIPMap() *FakeIPMap {
 	return s.fakeIPMap
 }
 
+// Upstream 返回上游 DNS 地址（供 TUN 引擎直接解析域名用）
+func (s *Server) Upstream() string {
+	return s.upstream
+}
+
 func (s *Server) handleDNS(w dns.ResponseWriter, r *dns.Msg) {
 	if len(r.Question) == 0 {
 		dns.HandleFailed(w, r)

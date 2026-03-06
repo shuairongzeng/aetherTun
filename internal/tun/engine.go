@@ -2,11 +2,13 @@ package tun
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/netip"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +30,20 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
+
+// #region agent log
+func debugLog(location, message string, data map[string]interface{}) {
+	f, err := os.OpenFile("debug-78d9cd.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	entry := map[string]interface{}{"sessionId": "78d9cd", "location": location, "message": message, "data": data, "timestamp": time.Now().UnixMilli()}
+	b, _ := json.Marshal(entry)
+	f.Write(append(b, '\n'))
+}
+
+// #endregion
 
 const (
 	defaultMTU     = 9000
@@ -53,18 +69,20 @@ type udpSession struct {
 }
 
 type Engine struct {
-	cfg          *config.Config
-	adapter      *wintun.Adapter
-	session      wintun.Session
-	sessionOK    bool
-	netStack     *stack.Stack
-	linkEP       *channel.Endpoint
-	dnsServer    *dns.Server
-	router       *routing.Engine
-	socks5       *proxy.Socks5Client
-	proxyProcName string // 自动检测到的代理进程名，出站流量强制 DIRECT
-	ctx          context.Context
-	cancel       context.CancelFunc
+	cfg            *config.Config
+	adapter        *wintun.Adapter
+	session        wintun.Session
+	sessionOK      bool
+	netStack       *stack.Stack
+	linkEP         *channel.Endpoint
+	dnsServer      *dns.Server
+	router         *routing.Engine
+	socks5         *proxy.Socks5Client
+	proxyProcName  string       // 自动检测到的代理进程名，出站流量强制 DIRECT
+	defaultIfIndex uint32       // 物理网卡索引，出站连接绑定此接口以绕过 TUN
+	directResolver *net.Resolver // 使用上游 DNS 直接解析，绕过 FakeIP
+	ctx            context.Context
+	cancel         context.CancelFunc
 
 	udpMu       sync.Mutex
 	udpSessions map[udpSessionKey]*udpSession
@@ -81,16 +99,36 @@ func New(cfg *config.Config, dnsServer *dns.Server, router *routing.Engine) *Eng
 		log.Printf("[TUN] 未检测到代理进程（端口 %d），可在 config.json 手动添加 process 规则", cfg.Proxy.Port)
 	}
 
-	return &Engine{
-		cfg:           cfg,
-		dnsServer:     dnsServer,
-		router:        router,
-		socks5:        proxy.NewSocks5Client(cfg.Proxy.Host, cfg.Proxy.Port),
-		proxyProcName: proxyProc,
-		ctx:           ctx,
-		cancel:        cancel,
-		udpSessions:   make(map[udpSessionKey]*udpSession),
+	// 在 TUN 路由接管前，记录物理网卡索引用于出站连接绕过 TUN
+	ifIndex := getDefaultInterfaceIndex()
+	if ifIndex > 0 {
+		log.Printf("[TUN] 默认出站网卡索引: %d", ifIndex)
+	} else {
+		log.Printf("[TUN] 警告: 未能获取默认网卡索引，DIRECT 连接可能形成回环")
 	}
+
+	e := &Engine{
+		cfg:            cfg,
+		dnsServer:      dnsServer,
+		router:         router,
+		socks5:         proxy.NewSocks5Client(cfg.Proxy.Host, cfg.Proxy.Port),
+		proxyProcName:  proxyProc,
+		defaultIfIndex: ifIndex,
+		ctx:            ctx,
+		cancel:         cancel,
+		udpSessions:    make(map[udpSessionKey]*udpSession),
+	}
+
+	upstream := dnsServer.Upstream()
+	e.directResolver = &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := net.Dialer{Control: e.protectSocket}
+			return d.DialContext(ctx, "udp", upstream)
+		},
+	}
+
+	return e
 }
 
 func (e *Engine) Start() error {
@@ -317,7 +355,13 @@ func (e *Engine) handleTCPConn(r *tcp.ForwarderRequest) {
 	case routing.ActionDirect:
 		log.Printf("[TCP] DIRECT %s:%d", targetHost, dstPort)
 		go e.relayConcurrent(appConn, func() (net.Conn, error) {
-			return net.Dial("tcp", net.JoinHostPort(targetHost, fmt.Sprintf("%d", dstPort)))
+			d := net.Dialer{Control: e.protectSocket, Resolver: e.directResolver}
+			addr := net.JoinHostPort(targetHost, fmt.Sprintf("%d", dstPort))
+			// #region agent log
+			ips, resolveErr := e.directResolver.LookupHost(e.ctx, targetHost)
+			debugLog("engine.go:TCP-DIRECT-dial", "TCP DIRECT resolution", map[string]interface{}{"hypothesisId": "H1", "targetHost": targetHost, "origDstIP": dstIP.String(), "resolvedIPs": ips, "resolveErr": fmt.Sprintf("%v", resolveErr), "dialAddr": addr})
+			// #endregion
+			return d.DialContext(e.ctx, "tcp", addr)
 		})
 	default: // proxy
 		log.Printf("[TCP] PROXY  %s:%d", targetHost, dstPort)
@@ -435,11 +479,25 @@ func (e *Engine) handleUDPPacket(r *udp.ForwarderRequest) (handled bool) {
 		return true
 	}
 
-	// 新建 session 前检查并发上限
+	// 新建 session 前检查并发上限，满时驱逐最旧会话
 	if len(e.udpSessions) >= maxUDPSessions {
-		e.udpMu.Unlock()
-		log.Printf("[UDP] 会话数达上限 (%d)，丢弃 %s:%d", maxUDPSessions, targetHost, dstPort)
-		return false
+		var oldestKey udpSessionKey
+		var oldestTime time.Time
+		first := true
+		for k, s := range e.udpSessions {
+			if first || s.lastSeen.Before(oldestTime) {
+				oldestKey = k
+				oldestTime = s.lastSeen
+				first = false
+			}
+		}
+		if !first {
+			e.udpSessions[oldestKey].cancel()
+			delete(e.udpSessions, oldestKey)
+			// #region agent log
+			debugLog("engine.go:handleUDPPacket", "UDP session evicted (LRU)", map[string]interface{}{"hypothesisId": "H2", "evictedKey": oldestKey.dstAddr, "sessionCount": len(e.udpSessions), "newDst": fmt.Sprintf("%s:%d", targetHost, dstPort)})
+			// #endregion
+		}
 	}
 	wq := new(waiter.Queue)
 	ep, tcpipErr := r.CreateEndpoint(wq)
@@ -459,6 +517,10 @@ func (e *Engine) handleUDPPacket(r *udp.ForwarderRequest) (handled bool) {
 	e.udpSessions[key] = sess
 	e.udpMu.Unlock()
 
+	// #region agent log
+	debugLog("engine.go:handleUDPPacket-newSession", "New UDP session created", map[string]interface{}{"hypothesisId": "H2", "sessionCount": len(e.udpSessions), "srcKey": srcKey, "dstKey": dstKey, "action": fmt.Sprintf("%v", action)})
+	// #endregion
+
 	switch action {
 	case routing.ActionDirect:
 		log.Printf("[UDP] DIRECT %s:%d", targetHost, dstPort)
@@ -475,14 +537,28 @@ func (e *Engine) relayUDPDirect(ctx context.Context, key udpSessionKey, appConn 
 	defer e.removeUDPSession(key)
 	defer appConn.Close()
 
-	outConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	lc := net.ListenConfig{Control: e.protectSocket}
+	pc, err := lc.ListenPacket(ctx, "udp4", ":0")
 	if err != nil {
 		log.Printf("[UDP] 创建出站 socket 失败: %v", err)
 		return
 	}
+	outConn := pc.(*net.UDPConn)
 	defer outConn.Close()
 
-	dstAddr := &net.UDPAddr{IP: net.ParseIP(host), Port: int(port)}
+	resolvedHost := host
+	if net.ParseIP(host) == nil {
+		ips, err := e.directResolver.LookupHost(ctx, host)
+		if err != nil || len(ips) == 0 {
+			log.Printf("[UDP] DNS 解析失败 %s: %v", host, err)
+			return
+		}
+		resolvedHost = ips[0]
+	}
+	dstAddr := &net.UDPAddr{IP: net.ParseIP(resolvedHost), Port: int(port)}
+	// #region agent log
+	debugLog("engine.go:relayUDPDirect", "UDP DIRECT dstAddr", map[string]interface{}{"hypothesisId": "H3", "host": host, "resolvedHost": resolvedHost, "port": port, "dstAddrIPNil": dstAddr.IP == nil})
+	// #endregion
 	buf := make([]byte, udpBufSize)
 
 	// app → out（每次 Read 是一个完整 datagram）
