@@ -332,6 +332,29 @@ func (e *Engine) relayConcurrent(appConn *gonet.TCPConn, dial func() (net.Conn, 
 
 // ─── UDP ──────────────────────────────────────────────────────────────────────
 
+// 广播/组播地址检测（这类流量不应通过代理转发）
+var (
+	_, udpMulticastRange, _ = net.ParseCIDR("224.0.0.0/4")
+	udpLimitedBroadcast     = net.IPv4(255, 255, 255, 255)
+)
+
+func isUDPBroadcastOrMulticast(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	if ip.Equal(udpLimitedBroadcast) {
+		return true
+	}
+	if udpMulticastRange.Contains(ip) {
+		return true
+	}
+	// 子网广播：末字节为 255（简单检测）
+	if ip4 := ip.To4(); ip4 != nil && ip4[3] == 255 {
+		return true
+	}
+	return false
+}
+
 // handleUDPPacket 是 udp.Forwarder 的回调，每个新 UDP 四元组触发一次
 func (e *Engine) handleUDPPacket(r *udp.ForwarderRequest) (handled bool) {
 	id := r.ID()
@@ -340,6 +363,11 @@ func (e *Engine) handleUDPPacket(r *udp.ForwarderRequest) (handled bool) {
 	srcKey := net.JoinHostPort(id.RemoteAddress.String(), fmt.Sprintf("%d", id.RemotePort))
 	dstKey := net.JoinHostPort(id.LocalAddress.String(), fmt.Sprintf("%d", dstPort))
 	key := udpSessionKey{srcAddr: srcKey, dstAddr: dstKey}
+
+	// 广播/组播直接丢弃，不尝试转发（会导致 socket 耗尽）
+	if isUDPBroadcastOrMulticast(dstIP) {
+		return false
+	}
 
 	// FakeIP → 还原真实域名
 	targetHost := dstIP.String()
@@ -417,22 +445,22 @@ func (e *Engine) relayUDPDirect(ctx context.Context, key udpSessionKey, appConn 
 			if err != nil {
 				return
 			}
-			outConn.SetWriteDeadline(time.Now().Add(udpTimeout))
+			outConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			outConn.WriteTo(pkt[:n], dstAddr)
 		}
 	}()
 
-	// out → app
+	// out → app（30s 无响应则关闭，避免单向流量（如 DNS 请求）永久挂起）
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
 		}
-		outConn.SetReadDeadline(time.Now().Add(udpTimeout))
+		outConn.SetReadDeadline(time.Now().Add(30 * time.Second))
 		n, _, err := outConn.ReadFromUDP(buf)
 		if err != nil {
-			return
+			return // 超时或关闭，正常退出
 		}
 		appConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		appConn.WriteTo(buf[:n], nil)
