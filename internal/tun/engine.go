@@ -35,6 +35,7 @@ const (
 	tcpReceiveWnd  = 0 // 0 = gVisor 默认
 	udpTimeout     = 60 * time.Second
 	udpBufSize     = 65536
+	maxUDPSessions = 512 // 同时最多 UDP 会话数，防止 socket 耗尽
 )
 
 // udpSessionKey 标识一条 UDP 会话（四元组）
@@ -268,8 +269,14 @@ func (e *Engine) handleTCPConn(r *tcp.ForwarderRequest) {
 		targetHost = domain
 	}
 
+	// 查找源进程名（IPv4 only，用于 process 规则匹配）
+	var procName string
+	if id.RemoteAddress.Len() == 4 {
+		procName = lookupTCPProcess(id.RemoteAddress.As4(), id.RemotePort)
+	}
+
 	// 路由决策
-	action := e.router.Match(dstIP, targetHost, "")
+	action := e.router.Match(dstIP, targetHost, procName)
 
 	if action == routing.ActionBlock {
 		log.Printf("[TCP] BLOCK  %s:%d", targetHost, dstPort)
@@ -383,8 +390,14 @@ func (e *Engine) handleUDPPacket(r *udp.ForwarderRequest) (handled bool) {
 		targetHost = domain
 	}
 
+	// 查找源进程名（IPv4 only）
+	var procName string
+	if id.RemoteAddress.Len() == 4 {
+		procName = lookupUDPProcess(id.RemoteAddress.As4(), id.RemotePort)
+	}
+
 	// 路由决策
-	action := e.router.Match(dstIP, targetHost, "")
+	action := e.router.Match(dstIP, targetHost, procName)
 	if action == routing.ActionBlock {
 		log.Printf("[UDP] BLOCK  %s:%d", targetHost, dstPort)
 		return false
@@ -400,7 +413,12 @@ func (e *Engine) handleUDPPacket(r *udp.ForwarderRequest) (handled bool) {
 		return true
 	}
 
-	// 新建 session
+	// 新建 session 前检查并发上限
+	if len(e.udpSessions) >= maxUDPSessions {
+		e.udpMu.Unlock()
+		log.Printf("[UDP] 会话数达上限 (%d)，丢弃 %s:%d", maxUDPSessions, targetHost, dstPort)
+		return false
+	}
 	wq := new(waiter.Queue)
 	ep, tcpipErr := r.CreateEndpoint(wq)
 	if tcpipErr != nil {
