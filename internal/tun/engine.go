@@ -273,6 +273,9 @@ func New(cfg *config.Config, dnsServer *dns.Server, router *routing.Engine) *Eng
 			debugLogCurrent(debugRunInvestigation, "H4", "engine.go:directResolver.Dial", "Resolver dial request", map[string]interface{}{"network": network, "resolverAddress": address, "forcedUpstream": upstream, "defaultIfIndex": e.defaultIfIndex, "defaultGateway": e.defaultGateway, "localIP": debugIPString(e.localIP)})
 			// #endregion
 			d := net.Dialer{}
+			if e.localIP != nil {
+				d.LocalAddr = &net.UDPAddr{IP: e.localIP}
+			}
 			conn, err := d.DialContext(ctx, "udp", upstream)
 			localAddr := ""
 			remoteAddr := ""
@@ -294,6 +297,9 @@ func New(cfg *config.Config, dnsServer *dns.Server, router *routing.Engine) *Eng
 			return conn, err
 		},
 	}
+
+	// 将物理网卡 IP 传给 DNS Server，让出站 DNS 查询绑定物理网卡
+	dnsServer.SetLocalIP(localIP)
 
 	ifaceName := ""
 	if ifIndex != 0 {
@@ -770,6 +776,7 @@ func (e *Engine) handleUDPPacket(r *udp.ForwarderRequest) (handled bool) {
 		}
 		if !first {
 			e.udpSessions[oldestKey].cancel()
+			e.udpSessions[oldestKey].appConn.Close()
 			delete(e.udpSessions, oldestKey)
 			// #region agent log
 			debugLog("engine.go:handleUDPPacket", "UDP session evicted (LRU)", map[string]interface{}{"hypothesisId": "H2", "evictedKey": oldestKey.dstAddr, "sessionCount": len(e.udpSessions), "newDst": fmt.Sprintf("%s:%d", targetHost, dstPort)})
@@ -948,6 +955,7 @@ func (e *Engine) cleanupUDPSessions() {
 			for key, sess := range e.udpSessions {
 				if now.Sub(sess.lastSeen) > udpTimeout {
 					sess.cancel()
+					sess.appConn.Close()
 					delete(e.udpSessions, key)
 				}
 			}

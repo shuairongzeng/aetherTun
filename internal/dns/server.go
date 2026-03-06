@@ -14,6 +14,7 @@ type Server struct {
 	fakeIPMap  *FakeIPMap
 	upstream   string
 	server     *dns.Server
+	localIP    net.IP // 物理网卡 IP，用于绑定出站 DNS socket 防止 TUN 回环
 }
 
 func NewServer(listenAddr, upstream, fakeIPCIDR string) (*Server, error) {
@@ -72,6 +73,12 @@ func (s *Server) Stop() {
 	}
 }
 
+// SetLocalIP 设置物理网卡 IP，让出站 DNS 查询绑定此地址绕过 TUN。
+// 在 TUN 引擎初始化后调用。
+func (s *Server) SetLocalIP(ip net.IP) {
+	s.localIP = ip
+}
+
 // FakeIPMap 暴露给 TUN handler 查询域名
 func (s *Server) FakeIPMap() *FakeIPMap {
 	return s.fakeIPMap
@@ -111,14 +118,22 @@ func (s *Server) LookupIPv4(ctx context.Context, host string) ([]string, string,
 	query.RecursionDesired = true
 	query.SetEdns0(1232, false)
 
-	udpClient := &dns.Client{Net: "udp", UDPSize: 1232}
+	udpDialer := &net.Dialer{}
+	if s.localIP != nil {
+		udpDialer.LocalAddr = &net.UDPAddr{IP: s.localIP}
+	}
+	udpClient := &dns.Client{Net: "udp", UDPSize: 1232, Dialer: udpDialer}
 	udpResp, _, udpErr := udpClient.ExchangeContext(ctx, query.Copy(), s.upstream)
 	udpIPs := extractIPv4Answers(udpResp)
 	if udpErr == nil && udpResp != nil && udpResp.Rcode == dns.RcodeSuccess && !udpResp.Truncated && len(udpIPs) > 0 {
 		return udpIPs, "udp", nil
 	}
 
-	tcpClient := &dns.Client{Net: "tcp"}
+	tcpDialer := &net.Dialer{}
+	if s.localIP != nil {
+		tcpDialer.LocalAddr = &net.TCPAddr{IP: s.localIP}
+	}
+	tcpClient := &dns.Client{Net: "tcp", Dialer: tcpDialer}
 	tcpResp, _, tcpErr := tcpClient.ExchangeContext(ctx, query.Copy(), s.upstream)
 	tcpIPs := extractIPv4Answers(tcpResp)
 	if tcpErr == nil && tcpResp != nil && tcpResp.Rcode == dns.RcodeSuccess && len(tcpIPs) > 0 {
