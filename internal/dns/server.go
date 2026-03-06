@@ -3,6 +3,7 @@ package dns
 import (
 	"fmt"
 	"net"
+	"time"
 
 	"github.com/miekg/dns"
 )
@@ -27,20 +28,41 @@ func NewServer(listenAddr, upstream, fakeIPCIDR string) (*Server, error) {
 }
 
 func (s *Server) Start() error {
+	// 等待绑定地址可用（最多 5 秒，适配器 IP 分配可能有延迟）
+	pc, err := waitBind(s.listenAddr, 5*time.Second)
+	if err != nil {
+		return fmt.Errorf("DNS 监听地址不可用 %s: %w", s.listenAddr, err)
+	}
+
 	mux := dns.NewServeMux()
 	mux.HandleFunc(".", s.handleDNS)
 	s.server = &dns.Server{
-		Addr:    s.listenAddr,
-		Net:     "udp",
-		Handler: mux,
+		PacketConn: pc,
+		Net:        "udp",
+		Handler:    mux,
 	}
 	go func() {
-		if err := s.server.ListenAndServe(); err != nil {
+		if err := s.server.ActivateAndServe(); err != nil {
 			fmt.Printf("[DNS] 服务器停止: %v\n", err)
 		}
 	}()
 	fmt.Printf("[DNS] 监听 %s (FakeIP 模式)\n", s.listenAddr)
 	return nil
+}
+
+// waitBind 重试绑定 UDP 地址，等待系统网络接口 IP 分配完成
+func waitBind(addr string, timeout time.Duration) (net.PacketConn, error) {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		pc, err := net.ListenPacket("udp", addr)
+		if err == nil {
+			return pc, nil
+		}
+		lastErr = err
+		time.Sleep(300 * time.Millisecond)
+	}
+	return nil, lastErr
 }
 
 func (s *Server) Stop() {
