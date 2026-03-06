@@ -119,7 +119,25 @@ func makeKey(ip [4]byte, port uint16) uint64 {
 	return uint64(ip[0])<<40 | uint64(ip[1])<<32 | uint64(ip[2])<<24 | uint64(ip[3])<<16 | uint64(port)
 }
 
-// pidToName 返回进程 exe 的小写基础文件名（e.g. "v2rayn.exe"）。
+// detectProxyProcessName 找出监听 proxyPort 的进程名（小写 exe 文件名）。
+// 用于在启动时自动识别代理程序（如 xray.exe），防止其出站流量被 TUN 截获形成环路。
+func detectProxyProcessName(proxyPort uint16) string {
+	buf := getTable(procGetExtendedTcpTable, afINET, tcpTableOwnerPIDAll)
+	if buf == nil {
+		return ""
+	}
+	n := *(*uint32)(unsafe.Pointer(&buf[0]))
+	const rowSz = unsafe.Sizeof(tcpRow4{})
+	const listenState = 2 // MIB_TCP_STATE_LISTEN
+	base := uintptr(unsafe.Pointer(&buf[4]))
+	for i := uint32(0); i < n; i++ {
+		row := (*tcpRow4)(unsafe.Pointer(base + uintptr(i)*rowSz))
+		if row.State == listenState && ntohsU32(row.LocalPort) == proxyPort {
+			return pidToName(row.OwningPID)
+		}
+	}
+	return ""
+}
 func pidToName(pid uint32) string {
 	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
 	if err != nil {

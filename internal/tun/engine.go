@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"time"
 
@@ -52,17 +53,18 @@ type udpSession struct {
 }
 
 type Engine struct {
-	cfg       *config.Config
-	adapter   *wintun.Adapter
-	session   wintun.Session
-	sessionOK bool
-	netStack  *stack.Stack
-	linkEP    *channel.Endpoint
-	dnsServer *dns.Server
-	router    *routing.Engine
-	socks5    *proxy.Socks5Client
-	ctx       context.Context
-	cancel    context.CancelFunc
+	cfg          *config.Config
+	adapter      *wintun.Adapter
+	session      wintun.Session
+	sessionOK    bool
+	netStack     *stack.Stack
+	linkEP       *channel.Endpoint
+	dnsServer    *dns.Server
+	router       *routing.Engine
+	socks5       *proxy.Socks5Client
+	proxyProcName string // 自动检测到的代理进程名，出站流量强制 DIRECT
+	ctx          context.Context
+	cancel       context.CancelFunc
 
 	udpMu       sync.Mutex
 	udpSessions map[udpSessionKey]*udpSession
@@ -70,14 +72,24 @@ type Engine struct {
 
 func New(cfg *config.Config, dnsServer *dns.Server, router *routing.Engine) *Engine {
 	ctx, cancel := context.WithCancel(context.Background())
+
+	// 自动检测监听代理端口的进程（如 xray.exe），启动时绑定一次
+	proxyProc := detectProxyProcessName(uint16(cfg.Proxy.Port))
+	if proxyProc != "" {
+		log.Printf("[TUN] 自动绕过代理进程: %s", proxyProc)
+	} else {
+		log.Printf("[TUN] 未检测到代理进程（端口 %d），可在 config.json 手动添加 process 规则", cfg.Proxy.Port)
+	}
+
 	return &Engine{
-		cfg:         cfg,
-		dnsServer:   dnsServer,
-		router:      router,
-		socks5:      proxy.NewSocks5Client(cfg.Proxy.Host, cfg.Proxy.Port),
-		ctx:         ctx,
-		cancel:      cancel,
-		udpSessions: make(map[udpSessionKey]*udpSession),
+		cfg:           cfg,
+		dnsServer:     dnsServer,
+		router:        router,
+		socks5:        proxy.NewSocks5Client(cfg.Proxy.Host, cfg.Proxy.Port),
+		proxyProcName: proxyProc,
+		ctx:           ctx,
+		cancel:        cancel,
+		udpSessions:   make(map[udpSessionKey]*udpSession),
 	}
 }
 
@@ -275,8 +287,13 @@ func (e *Engine) handleTCPConn(r *tcp.ForwarderRequest) {
 		procName = lookupTCPProcess(id.RemoteAddress.As4(), id.RemotePort)
 	}
 
-	// 路由决策
-	action := e.router.Match(dstIP, targetHost, procName)
+	// 路由决策：代理进程自身强制 DIRECT，防止环路
+	var action routing.Action
+	if e.proxyProcName != "" && strings.EqualFold(procName, e.proxyProcName) {
+		action = routing.ActionDirect
+	} else {
+		action = e.router.Match(dstIP, targetHost, procName)
+	}
 
 	if action == routing.ActionBlock {
 		log.Printf("[TCP] BLOCK  %s:%d", targetHost, dstPort)
@@ -396,8 +413,13 @@ func (e *Engine) handleUDPPacket(r *udp.ForwarderRequest) (handled bool) {
 		procName = lookupUDPProcess(id.RemoteAddress.As4(), id.RemotePort)
 	}
 
-	// 路由决策
-	action := e.router.Match(dstIP, targetHost, procName)
+	// 路由决策：代理进程自身强制 DIRECT，防止环路
+	var action routing.Action
+	if e.proxyProcName != "" && strings.EqualFold(procName, e.proxyProcName) {
+		action = routing.ActionDirect
+	} else {
+		action = e.router.Match(dstIP, targetHost, procName)
+	}
 	if action == routing.ActionBlock {
 		log.Printf("[UDP] BLOCK  %s:%d", targetHost, dstPort)
 		return false
