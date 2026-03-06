@@ -1,6 +1,7 @@
 package dns
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"time"
@@ -79,6 +80,61 @@ func (s *Server) FakeIPMap() *FakeIPMap {
 // Upstream 返回上游 DNS 地址（供 TUN 引擎直接解析域名用）
 func (s *Server) Upstream() string {
 	return s.upstream
+}
+
+func extractIPv4Answers(resp *dns.Msg) []string {
+	if resp == nil {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	ips := make([]string, 0, len(resp.Answer))
+	for _, answer := range resp.Answer {
+		a, ok := answer.(*dns.A)
+		if !ok || a.A == nil {
+			continue
+		}
+		ip := a.A.String()
+		if _, exists := seen[ip]; exists {
+			continue
+		}
+		seen[ip] = struct{}{}
+		ips = append(ips, ip)
+	}
+	return ips
+}
+
+// LookupIPv4 queries the upstream resolver for A records and falls back to TCP
+// when UDP fails or returns a truncated / empty response.
+func (s *Server) LookupIPv4(ctx context.Context, host string) ([]string, string, error) {
+	query := new(dns.Msg)
+	query.SetQuestion(dns.Fqdn(host), dns.TypeA)
+	query.RecursionDesired = true
+	query.SetEdns0(1232, false)
+
+	udpClient := &dns.Client{Net: "udp", UDPSize: 1232}
+	udpResp, _, udpErr := udpClient.ExchangeContext(ctx, query.Copy(), s.upstream)
+	udpIPs := extractIPv4Answers(udpResp)
+	if udpErr == nil && udpResp != nil && udpResp.Rcode == dns.RcodeSuccess && !udpResp.Truncated && len(udpIPs) > 0 {
+		return udpIPs, "udp", nil
+	}
+
+	tcpClient := &dns.Client{Net: "tcp"}
+	tcpResp, _, tcpErr := tcpClient.ExchangeContext(ctx, query.Copy(), s.upstream)
+	tcpIPs := extractIPv4Answers(tcpResp)
+	if tcpErr == nil && tcpResp != nil && tcpResp.Rcode == dns.RcodeSuccess && len(tcpIPs) > 0 {
+		return tcpIPs, "tcp-fallback", nil
+	}
+
+	if tcpErr != nil {
+		return nil, "tcp-fallback", fmt.Errorf("udp lookup failed: %v; tcp lookup failed: %w", udpErr, tcpErr)
+	}
+	if tcpResp == nil {
+		return nil, "tcp-fallback", fmt.Errorf("tcp lookup returned empty response for %s", host)
+	}
+	if tcpResp.Rcode != dns.RcodeSuccess {
+		return nil, "tcp-fallback", fmt.Errorf("tcp lookup rcode=%s for %s", dns.RcodeToString[tcpResp.Rcode], host)
+	}
+	return nil, "tcp-fallback", fmt.Errorf("upstream DNS returned no IPv4 records for %s", host)
 }
 
 // ProcessQuery 接收一条原始 DNS 请求字节，处理后返回响应字节。

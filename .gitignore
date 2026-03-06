@@ -2,6 +2,9 @@ aether.exe
 *.exe
 config.json
 logs/
+*.log
 .beads/
 wintun_extracted/
 wintun.zip
+.spec-workflow/
+.cursor/
