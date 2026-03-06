@@ -101,25 +101,32 @@ func (e *Engine) Start() error {
 	e.session = session
 	e.sessionOK = true
 
-	// 2. 初始化 gVisor 网络栈
+	// 2. 配置 Windows 适配器 IP 和路由（需在 gVisor 初始化前完成）
+	if err := e.configureWindowsAdapter(); err != nil {
+		e.session.End()
+		e.adapter.Close()
+		return fmt.Errorf("配置网络适配器失败: %w", err)
+	}
+
+	// 3. 初始化 gVisor 网络栈
 	if err := e.initStack(mtu); err != nil {
 		e.session.End()
 		e.adapter.Close()
 		return err
 	}
 
-	// 3. 注册 TCP forwarder（正确的连接级拦截方式）
+	// 4. 注册 TCP forwarder（正确的连接级拦截方式）
 	tcpFwd := tcp.NewForwarder(e.netStack, tcpReceiveWnd, tcpMaxInFlight, e.handleTCPConn)
 	e.netStack.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpFwd.HandlePacket)
 
-	// 4. 注册 UDP forwarder
+	// 5. 注册 UDP forwarder
 	udpFwd := udp.NewForwarder(e.netStack, e.handleUDPPacket)
 	e.netStack.SetTransportProtocolHandler(udp.ProtocolNumber, udpFwd.HandlePacket)
 
-	// 5. 启动 UDP session 过期清理
+	// 6. 启动 UDP session 过期清理
 	go e.cleanupUDPSessions()
 
-	// 6. 启动 wintun ↔ gVisor 数据泵
+	// 7. 启动 wintun ↔ gVisor 数据泵
 	go e.readFromTUN()
 	go e.writeToTUN()
 
@@ -130,6 +137,7 @@ func (e *Engine) Start() error {
 
 func (e *Engine) Stop() {
 	e.cancel()
+	e.teardownWindowsAdapter()
 	if e.sessionOK {
 		e.session.End()
 		e.sessionOK = false

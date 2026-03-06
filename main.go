@@ -40,7 +40,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 启动 DNS 服务器
+	// 初始化路由引擎
+	router := routing.New(&cfg.Routing)
+
+	// 先启动 TUN 引擎（自动配置适配器 IP，DNS 才能 bind）
 	dnsServer, err := dns.NewServer(
 		cfg.Tun.DNSListen,
 		cfg.DNS.Upstream,
@@ -50,22 +53,20 @@ func main() {
 		fmt.Fprintf(os.Stderr, "初始化 DNS 失败: %v\n", err)
 		os.Exit(1)
 	}
-	if err := dnsServer.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "启动 DNS 失败: %v\n", err)
-		os.Exit(1)
-	}
-	defer dnsServer.Stop()
 
-	// 初始化路由引擎
-	router := routing.New(&cfg.Routing)
-
-	// 启动 TUN 引擎
 	engine := tun.New(cfg, dnsServer, router)
 	if err := engine.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "启动 TUN 失败: %v\n", err)
 		os.Exit(1)
 	}
 	defer engine.Stop()
+
+	// TUN 适配器 IP 已配置，现在可以启动 DNS 服务器
+	if err := dnsServer.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "启动 DNS 失败: %v\n", err)
+		os.Exit(1)
+	}
+	defer dnsServer.Stop()
 
 	fmt.Printf("代理: %s://%s:%d\n", cfg.Proxy.Type, cfg.Proxy.Host, cfg.Proxy.Port)
 	fmt.Printf("TUN: %s (%s)\n", cfg.Tun.AdapterName, cfg.Tun.Address)
