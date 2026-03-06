@@ -81,15 +81,29 @@ func (s *Server) Upstream() string {
 	return s.upstream
 }
 
-func (s *Server) handleDNS(w dns.ResponseWriter, r *dns.Msg) {
-	if len(r.Question) == 0 {
-		dns.HandleFailed(w, r)
-		return
+// ProcessQuery 接收一条原始 DNS 请求字节，处理后返回响应字节。
+// 供 TUN 引擎在 gVisor UDP 层内联处理 DNS，无需经过网络。
+func (s *Server) ProcessQuery(data []byte) []byte {
+	msg := new(dns.Msg)
+	if err := msg.Unpack(data); err != nil {
+		return nil
 	}
+	resp := s.processMsg(msg)
+	out, err := resp.Pack()
+	if err != nil {
+		return nil
+	}
+	return out
+}
 
+func (s *Server) processMsg(r *dns.Msg) *dns.Msg {
+	if len(r.Question) == 0 {
+		m := new(dns.Msg)
+		m.SetRcode(r, dns.RcodeServerFailure)
+		return m
+	}
 	q := r.Question[0]
 	domain := dns.Fqdn(q.Name)
-	// 去掉末尾的 .
 	domain = domain[:len(domain)-1]
 
 	m := new(dns.Msg)
@@ -107,13 +121,23 @@ func (s *Server) handleDNS(w dns.ResponseWriter, r *dns.Msg) {
 			},
 			A: fakeIP,
 		})
-		w.WriteMsg(m)
 		fmt.Printf("[DNS] %s → FakeIP %s\n", domain, fakeIP)
-		return
+		return m
 	}
 
-	// AAAA / 其他类型：转发到上游
-	s.forward(w, r)
+	// 非 A 记录转发到上游
+	c := new(dns.Client)
+	resp, _, err := c.Exchange(r, s.upstream)
+	if err != nil {
+		m.SetRcode(r, dns.RcodeServerFailure)
+		return m
+	}
+	return resp
+}
+
+func (s *Server) handleDNS(w dns.ResponseWriter, r *dns.Msg) {
+	resp := s.processMsg(r)
+	w.WriteMsg(resp)
 }
 
 func (s *Server) forward(w dns.ResponseWriter, r *dns.Msg) {

@@ -3,7 +3,6 @@
 package tun
 
 import (
-	"encoding/binary"
 	"fmt"
 	"net"
 	"net/netip"
@@ -15,6 +14,32 @@ import (
 )
 
 const ipUnicastIF = 31 // IP_UNICAST_IF socket option
+
+// getPhysicalInterfaceIP 返回指定网卡索引的首个 IPv4 单播地址。
+// 在 TUN 接管默认路由前调用，用于 protectSocket 绑定物理网卡。
+func getPhysicalInterfaceIP(ifIndex uint32) net.IP {
+	iface, err := net.InterfaceByIndex(int(ifIndex))
+	if err != nil {
+		return nil
+	}
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return nil
+	}
+	for _, addr := range addrs {
+		var ip net.IP
+		switch v := addr.(type) {
+		case *net.IPNet:
+			ip = v.IP
+		case *net.IPAddr:
+			ip = v.IP
+		}
+		if ip4 := ip.To4(); ip4 != nil && !ip4.IsLoopback() {
+			return ip4
+		}
+	}
+	return nil
+}
 
 // getDefaultInterfaceIndex returns the OS interface index used for public
 // traffic. Must be called BEFORE TUN routes override the default route.
@@ -29,22 +54,23 @@ func getDefaultInterfaceIndex() uint32 {
 	return ifIdx
 }
 
-// protectSocket sets IP_UNICAST_IF on the socket so outbound traffic from
-// aether.exe bypasses the TUN adapter and goes through the physical NIC.
+// protectSocket 将 socket 绑定到物理网卡 IP，使出站连接绕过 TUN 默认路由。
+// Windows 强主机模型保证：源 IP 属于哪个接口，报文就从那个接口出去。
 func (e *Engine) protectSocket(network, address string, c syscall.RawConn) error {
-	if e.defaultIfIndex == 0 {
+	if e.localIP == nil {
 		return nil
 	}
-	var sockErr error
-	if err := c.Control(func(fd uintptr) {
-		var buf [4]byte
-		binary.BigEndian.PutUint32(buf[:], e.defaultIfIndex)
-		nbo := *(*uint32)(unsafe.Pointer(&buf[0]))
-		sockErr = syscall.SetsockoptInt(syscall.Handle(fd), syscall.IPPROTO_IP, ipUnicastIF, int(nbo))
-	}); err != nil {
-		return err
+	ip4 := e.localIP.To4()
+	if ip4 == nil {
+		return nil
 	}
-	return sockErr
+	var innerErr error
+	c.Control(func(fd uintptr) {
+		sa := &syscall.SockaddrInet4{}
+		copy(sa.Addr[:], ip4)
+		innerErr = syscall.Bind(syscall.Handle(fd), sa)
+	})
+	return innerErr
 }
 
 // configureWindowsAdapter 為 wintun 適配器分配 IP，並（若啟用）配置系統路由和 DNS

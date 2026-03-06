@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -78,8 +79,11 @@ type Engine struct {
 	dnsServer      *dns.Server
 	router         *routing.Engine
 	socks5         *proxy.Socks5Client
-	proxyProcName  string       // 自动检测到的代理进程名，出站流量强制 DIRECT
-	defaultIfIndex uint32       // 物理网卡索引，出站连接绑定此接口以绕过 TUN
+	proxyProcName  string        // 自动检测到的代理进程名，出站流量强制 DIRECT
+	defaultIfIndex uint32        // 物理网卡索引
+	localIP        net.IP        // 物理网卡 IPv4 地址，用于 protectSocket 绑定
+	dnsIP          net.IP        // TUN FakeIP DNS 监听 IP
+	dnsPort        uint16        // TUN FakeIP DNS 监听端口
 	directResolver *net.Resolver // 使用上游 DNS 直接解析，绕过 FakeIP
 	ctx            context.Context
 	cancel         context.CancelFunc
@@ -101,11 +105,16 @@ func New(cfg *config.Config, dnsServer *dns.Server, router *routing.Engine) *Eng
 
 	// 在 TUN 路由接管前，记录物理网卡索引用于出站连接绕过 TUN
 	ifIndex := getDefaultInterfaceIndex()
-	if ifIndex > 0 {
-		log.Printf("[TUN] 默认出站网卡索引: %d", ifIndex)
+	localIP := getPhysicalInterfaceIP(ifIndex)
+	if localIP != nil {
+		log.Printf("[TUN] 默认出站网卡: index=%d ip=%s（DIRECT 连接绑定此地址）", ifIndex, localIP)
 	} else {
-		log.Printf("[TUN] 警告: 未能获取默认网卡索引，DIRECT 连接可能形成回环")
+		log.Printf("[TUN] 警告: 未能获取默认网卡 IP，DIRECT 连接可能形成回环")
 	}
+
+	// 解析 FakeIP DNS 监听地址（用于在 UDP handler 内联处理 DNS 查询）
+	dnsHost, dnsPortStr, _ := net.SplitHostPort(cfg.Tun.DNSListen)
+	dnsPortNum, _ := strconv.Atoi(dnsPortStr)
 
 	e := &Engine{
 		cfg:            cfg,
@@ -114,6 +123,9 @@ func New(cfg *config.Config, dnsServer *dns.Server, router *routing.Engine) *Eng
 		socks5:         proxy.NewSocks5Client(cfg.Proxy.Host, cfg.Proxy.Port),
 		proxyProcName:  proxyProc,
 		defaultIfIndex: ifIndex,
+		localIP:        localIP,
+		dnsIP:          net.ParseIP(dnsHost),
+		dnsPort:        uint16(dnsPortNum),
 		ctx:            ctx,
 		cancel:         cancel,
 		udpSessions:    make(map[udpSessionKey]*udpSession),
@@ -445,6 +457,22 @@ func (e *Engine) handleUDPPacket(r *udp.ForwarderRequest) (handled bool) {
 		return false
 	}
 
+	// FakeIP DNS 查询：在 gVisor 内联处理，不走代理/直连，避免环路
+	if e.dnsIP != nil && dstIP.Equal(e.dnsIP) && dstPort == e.dnsPort {
+		wq := new(waiter.Queue)
+		ep, tcpipErr := r.CreateEndpoint(wq)
+		if tcpipErr != nil {
+			return false
+		}
+		appConn := gonet.NewUDPConn(wq, ep)
+		ctx, cancel := context.WithCancel(e.ctx)
+		e.udpMu.Lock()
+		e.udpSessions[key] = &udpSession{appConn: appConn, cancel: cancel, lastSeen: time.Now()}
+		e.udpMu.Unlock()
+		go e.serveDNSConn(ctx, key, appConn)
+		return true
+	}
+
 	// FakeIP → 还原真实域名
 	targetHost := dstIP.String()
 	if domain, ok := e.dnsServer.FakeIPMap().LookupDomain(dstIP); ok {
@@ -672,6 +700,35 @@ func (e *Engine) cleanupUDPSessions() {
 				}
 			}
 			e.udpMu.Unlock()
+		}
+	}
+}
+
+// serveDNSConn 在 gVisor UDP 端点内联处理 FakeIP DNS 查询，无需经过网络 socket。
+// 避免 198.18.0.2:53 的流量被 TUN 当作普通 UDP 代理，形成回环。
+func (e *Engine) serveDNSConn(ctx context.Context, key udpSessionKey, appConn *gonet.UDPConn) {
+	defer e.removeUDPSession(key)
+	defer appConn.Close()
+
+	buf := make([]byte, 4096)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		appConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		n, _, err := appConn.ReadFrom(buf)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			continue
+		}
+		resp := e.dnsServer.ProcessQuery(buf[:n])
+		if resp != nil {
+			appConn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			appConn.WriteTo(resp, nil)
 		}
 	}
 }
