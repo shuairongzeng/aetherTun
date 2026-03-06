@@ -27,6 +27,12 @@ func main() {
 
 	fmt.Printf("Aether v%s 启动中...\n", version)
 
+	// 释放内嵌的 wintun.dll（版本 0.14.1）到 exe 同目录
+	if err := extractWintunDLL(); err != nil {
+		fmt.Fprintf(os.Stderr, "释放 wintun.dll 失败: %v\n", err)
+		os.Exit(1)
+	}
+
 	// 加载配置
 	cfg, err := config.Load(*configPath)
 	if err != nil {

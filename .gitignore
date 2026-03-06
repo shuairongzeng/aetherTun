@@ -3,3 +3,5 @@ aether.exe
 config.json
 logs/
 .beads/
+wintun_extracted/
+wintun.zip
