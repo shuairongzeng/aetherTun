@@ -1,7 +1,7 @@
 aether.exe
 *.exe
 config.json
-logs/
+/logs/
 *.log
 .beads/
 wintun_extracted/
