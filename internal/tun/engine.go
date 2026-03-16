@@ -144,13 +144,13 @@ func currentProcessName() string {
 }
 
 const (
-	defaultMTU     = 9000
-	tcpQueueSize   = 512
-	tcpMaxInFlight = 1024
-	tcpReceiveWnd  = 0 // 0 = gVisor 默认
-	udpTimeout     = 60 * time.Second
-	udpBufSize     = 65536
-	maxUDPSessions = 512 // 同时最多 UDP 会话数，防止 socket 耗尽
+	defaultMTU            = 9000
+	tcpQueueSize          = 512
+	tcpMaxInFlight        = 1024
+	tcpReceiveWnd         = 0 // 0 = gVisor 默认
+	udpTimeout            = 60 * time.Second
+	udpBufSize            = 65536
+	defaultMaxUDPSessions = 2048 // 同时最多 UDP 会话数，防止 socket 耗尽
 )
 
 // udpSessionKey 标识一条 UDP 会话（四元组）
@@ -190,6 +190,7 @@ type Engine struct {
 
 	udpMu             sync.Mutex
 	udpSessions       map[udpSessionKey]*udpSession
+	maxUDPSessions    int
 	routeMu           sync.Mutex
 	routeRefs         map[string]int
 	dnsRouteRelease   func()
@@ -257,7 +258,11 @@ func New(cfg *config.Config, dnsServer *dns.Server, router *routing.Engine) *Eng
 		ctx:            ctx,
 		cancel:         cancel,
 		udpSessions:    make(map[udpSessionKey]*udpSession),
+		maxUDPSessions: cfg.Tun.MaxUDPSessions,
 		routeRefs:      make(map[string]int),
+	}
+	if e.maxUDPSessions <= 0 {
+		e.maxUDPSessions = defaultMaxUDPSessions
 	}
 
 	upstream := dnsServer.Upstream()
@@ -321,7 +326,7 @@ func (e *Engine) Start() error {
 	}
 
 	// 1. 创建 wintun 适配器
-	adapter, err := wintun.CreateAdapter(e.cfg.Tun.AdapterName, "Wintun", nil)
+	adapter, err := createAdapterSafe(e.cfg.Tun.AdapterName)
 	if err != nil {
 		return fmt.Errorf("创建 TUN 适配器失败: %w", err)
 	}
@@ -763,7 +768,7 @@ func (e *Engine) handleUDPPacket(r *udp.ForwarderRequest) (handled bool) {
 	}
 
 	// 新建 session 前检查并发上限，满时驱逐最旧会话
-	if len(e.udpSessions) >= maxUDPSessions {
+	if len(e.udpSessions) >= e.maxUDPSessions {
 		var oldestKey udpSessionKey
 		var oldestTime time.Time
 		first := true
