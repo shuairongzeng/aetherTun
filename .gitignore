@@ -8,3 +8,10 @@ wintun_extracted/
 wintun.zip
 .spec-workflow/
 .cursor/
+.worktrees/
+build/bin/
+frontend/dist/
+frontend/node_modules/
+frontend/package.json.md5
+tmp/
+*.bak

@@ -15,6 +15,7 @@ import (
 )
 
 const ipUnicastIF = 31 // IP_UNICAST_IF socket option
+const createNoWindow = 0x08000000
 
 // getPhysicalInterfaceIP 返回指定网卡索引的首个 IPv4 单播地址。
 // 在 TUN 接管默认路由前调用，用于 protectSocket 绑定物理网卡。
@@ -401,6 +402,15 @@ func waitAdapterReady(name string, timeout time.Duration) error {
 }
 
 func run(name string, args ...string) (string, error) {
-	out, err := exec.Command(name, args...).CombinedOutput()
+	out, err := newHiddenCommand(name, args...).CombinedOutput()
 	return string(out), err
+}
+
+func newHiddenCommand(name string, args ...string) *exec.Cmd {
+	cmd := exec.Command(name, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		HideWindow:    true,
+		CreationFlags: createNoWindow,
+	}
+	return cmd
 }

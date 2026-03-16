@@ -1,20 +1,25 @@
-package dns
+﻿package dns
 
 import (
 	"context"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
-	"github.com/miekg/dns"
+	mdns "github.com/miekg/dns"
 )
 
+const defaultUpstreamTransport = "tcp"
+
 type Server struct {
-	listenAddr string
-	fakeIPMap  *FakeIPMap
-	upstream   string
-	server     *dns.Server
-	localIP    net.IP // 物理网卡 IP，用于绑定出站 DNS socket 防止 TUN 回环
+	listenAddr        string
+	fakeIPMap         *FakeIPMap
+	upstream          string
+	upstreamTransport string
+	server            *mdns.Server
+	eventHook         func(event string, err error)
+	localIP           net.IP
 }
 
 func NewServer(listenAddr, upstream, fakeIPCIDR string) (*Server, error) {
@@ -23,22 +28,22 @@ func NewServer(listenAddr, upstream, fakeIPCIDR string) (*Server, error) {
 		return nil, fmt.Errorf("初始化 FakeIP 池失败: %w", err)
 	}
 	return &Server{
-		listenAddr: listenAddr,
-		fakeIPMap:  fakeMap,
-		upstream:   upstream,
+		listenAddr:        listenAddr,
+		fakeIPMap:         fakeMap,
+		upstream:          upstream,
+		upstreamTransport: defaultUpstreamTransport,
 	}, nil
 }
 
 func (s *Server) Start() error {
-	// 等待绑定地址可用（最多 5 秒，适配器 IP 分配可能有延迟）
 	pc, err := waitBind(s.listenAddr, 5*time.Second)
 	if err != nil {
 		return fmt.Errorf("DNS 监听地址不可用 %s: %w", s.listenAddr, err)
 	}
 
-	mux := dns.NewServeMux()
+	mux := mdns.NewServeMux()
 	mux.HandleFunc(".", s.handleDNS)
-	s.server = &dns.Server{
+	s.server = &mdns.Server{
 		PacketConn: pc,
 		Net:        "udp",
 		Handler:    mux,
@@ -52,7 +57,6 @@ func (s *Server) Start() error {
 	return nil
 }
 
-// waitBind 重试绑定 UDP 地址，等待系统网络接口 IP 分配完成
 func waitBind(addr string, timeout time.Duration) (net.PacketConn, error) {
 	deadline := time.Now().Add(timeout)
 	var lastErr error
@@ -73,30 +77,30 @@ func (s *Server) Stop() {
 	}
 }
 
-// SetLocalIP 设置物理网卡 IP，让出站 DNS 查询绑定此地址绕过 TUN。
-// 在 TUN 引擎初始化后调用。
 func (s *Server) SetLocalIP(ip net.IP) {
 	s.localIP = ip
 }
 
-// FakeIPMap 暴露给 TUN handler 查询域名
+func (s *Server) SetUpstreamTransport(transport string) {
+	s.upstreamTransport = normalizeUpstreamTransport(transport)
+}
+
 func (s *Server) FakeIPMap() *FakeIPMap {
 	return s.fakeIPMap
 }
 
-// Upstream 返回上游 DNS 地址（供 TUN 引擎直接解析域名用）
 func (s *Server) Upstream() string {
 	return s.upstream
 }
 
-func extractIPv4Answers(resp *dns.Msg) []string {
+func extractIPv4Answers(resp *mdns.Msg) []string {
 	if resp == nil {
 		return nil
 	}
 	seen := make(map[string]struct{})
 	ips := make([]string, 0, len(resp.Answer))
 	for _, answer := range resp.Answer {
-		a, ok := answer.(*dns.A)
+		a, ok := answer.(*mdns.A)
 		if !ok || a.A == nil {
 			continue
 		}
@@ -110,52 +114,54 @@ func extractIPv4Answers(resp *dns.Msg) []string {
 	return ips
 }
 
-// LookupIPv4 queries the upstream resolver for A records and falls back to TCP
-// when UDP fails or returns a truncated / empty response.
 func (s *Server) LookupIPv4(ctx context.Context, host string) ([]string, string, error) {
-	query := new(dns.Msg)
-	query.SetQuestion(dns.Fqdn(host), dns.TypeA)
+	query := new(mdns.Msg)
+	query.SetQuestion(mdns.Fqdn(host), mdns.TypeA)
 	query.RecursionDesired = true
 	query.SetEdns0(1232, false)
 
-	udpDialer := &net.Dialer{}
-	if s.localIP != nil {
-		udpDialer.LocalAddr = &net.UDPAddr{IP: s.localIP}
-	}
-	udpClient := &dns.Client{Net: "udp", UDPSize: 1232, Dialer: udpDialer}
-	udpResp, _, udpErr := udpClient.ExchangeContext(ctx, query.Copy(), s.upstream)
-	udpIPs := extractIPv4Answers(udpResp)
-	if udpErr == nil && udpResp != nil && udpResp.Rcode == dns.RcodeSuccess && !udpResp.Truncated && len(udpIPs) > 0 {
-		return udpIPs, "udp", nil
+	networks := s.preferredNetworks()
+	lastMode := networks[len(networks)-1] + "-fallback"
+	failures := make([]string, 0, len(networks))
+
+	for index, network := range networks {
+		resp, err := s.exchangeUpstream(ctx, query.Copy(), network)
+		mode := network
+		if index > 0 {
+			mode += "-fallback"
+		}
+		lastMode = mode
+
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("%s exchange failed: %v", network, err))
+			continue
+		}
+		if resp == nil {
+			failures = append(failures, fmt.Sprintf("%s exchange returned empty response", network))
+			continue
+		}
+		if resp.Rcode != mdns.RcodeSuccess {
+			failures = append(failures, fmt.Sprintf("%s lookup rcode=%s for %s", network, mdns.RcodeToString[resp.Rcode], host))
+			continue
+		}
+		if network == "udp" && resp.Truncated {
+			failures = append(failures, fmt.Sprintf("%s lookup returned truncated response for %s", network, host))
+			continue
+		}
+
+		ips := extractIPv4Answers(resp)
+		if len(ips) == 0 {
+			failures = append(failures, fmt.Sprintf("%s lookup returned no IPv4 records for %s", network, host))
+			continue
+		}
+		return ips, mode, nil
 	}
 
-	tcpDialer := &net.Dialer{}
-	if s.localIP != nil {
-		tcpDialer.LocalAddr = &net.TCPAddr{IP: s.localIP}
-	}
-	tcpClient := &dns.Client{Net: "tcp", Dialer: tcpDialer}
-	tcpResp, _, tcpErr := tcpClient.ExchangeContext(ctx, query.Copy(), s.upstream)
-	tcpIPs := extractIPv4Answers(tcpResp)
-	if tcpErr == nil && tcpResp != nil && tcpResp.Rcode == dns.RcodeSuccess && len(tcpIPs) > 0 {
-		return tcpIPs, "tcp-fallback", nil
-	}
-
-	if tcpErr != nil {
-		return nil, "tcp-fallback", fmt.Errorf("udp lookup failed: %v; tcp lookup failed: %w", udpErr, tcpErr)
-	}
-	if tcpResp == nil {
-		return nil, "tcp-fallback", fmt.Errorf("tcp lookup returned empty response for %s", host)
-	}
-	if tcpResp.Rcode != dns.RcodeSuccess {
-		return nil, "tcp-fallback", fmt.Errorf("tcp lookup rcode=%s for %s", dns.RcodeToString[tcpResp.Rcode], host)
-	}
-	return nil, "tcp-fallback", fmt.Errorf("upstream DNS returned no IPv4 records for %s", host)
+	return nil, lastMode, fmt.Errorf("%s", strings.Join(failures, "; "))
 }
 
-// ProcessQuery 接收一条原始 DNS 请求字节，处理后返回响应字节。
-// 供 TUN 引擎在 gVisor UDP 层内联处理 DNS，无需经过网络。
 func (s *Server) ProcessQuery(data []byte) []byte {
-	msg := new(dns.Msg)
+	msg := new(mdns.Msg)
 	if err := msg.Unpack(data); err != nil {
 		return nil
 	}
@@ -167,62 +173,125 @@ func (s *Server) ProcessQuery(data []byte) []byte {
 	return out
 }
 
-func (s *Server) processMsg(r *dns.Msg) *dns.Msg {
+func (s *Server) processMsg(r *mdns.Msg) *mdns.Msg {
 	if len(r.Question) == 0 {
-		m := new(dns.Msg)
-		m.SetRcode(r, dns.RcodeServerFailure)
+		m := new(mdns.Msg)
+		m.SetRcode(r, mdns.RcodeServerFailure)
 		return m
 	}
 	q := r.Question[0]
-	domain := dns.Fqdn(q.Name)
+	domain := mdns.Fqdn(q.Name)
 	domain = domain[:len(domain)-1]
 
-	m := new(dns.Msg)
+	m := new(mdns.Msg)
 	m.SetReply(r)
 	m.Authoritative = true
 
-	if q.Qtype == dns.TypeA {
+	if q.Qtype == mdns.TypeA {
 		fakeIP := s.fakeIPMap.Assign(domain)
-		m.Answer = append(m.Answer, &dns.A{
-			Hdr: dns.RR_Header{
+		m.Answer = append(m.Answer, &mdns.A{
+			Hdr: mdns.RR_Header{
 				Name:   q.Name,
-				Rrtype: dns.TypeA,
-				Class:  dns.ClassINET,
+				Rrtype: mdns.TypeA,
+				Class:  mdns.ClassINET,
 				Ttl:    1,
 			},
 			A: fakeIP,
 		})
-		fmt.Printf("[DNS] %s → FakeIP %s\n", domain, fakeIP)
+		fmt.Printf("[DNS] %s -> FakeIP %s\n", domain, fakeIP)
 		return m
 	}
 
-	// 非 A 记录转发到上游
-	c := new(dns.Client)
-	resp, _, err := c.Exchange(r, s.upstream)
+	resp, _, err := s.exchangeUpstreamWithFallback(context.Background(), r)
 	if err != nil {
-		m.SetRcode(r, dns.RcodeServerFailure)
+		m.SetRcode(r, mdns.RcodeServerFailure)
 		return m
 	}
 	return resp
 }
 
-func (s *Server) handleDNS(w dns.ResponseWriter, r *dns.Msg) {
+func (s *Server) handleDNS(w mdns.ResponseWriter, r *mdns.Msg) {
 	resp := s.processMsg(r)
 	w.WriteMsg(resp)
 }
 
-func (s *Server) forward(w dns.ResponseWriter, r *dns.Msg) {
-	c := new(dns.Client)
-	resp, _, err := c.Exchange(r, s.upstream)
+func (s *Server) forward(w mdns.ResponseWriter, r *mdns.Msg) {
+	resp, _, err := s.exchangeUpstreamWithFallback(context.Background(), r)
 	if err != nil {
-		dns.HandleFailed(w, r)
+		mdns.HandleFailed(w, r)
 		return
 	}
 	w.WriteMsg(resp)
 }
 
-// IsLocalAddr 判断是否是 DNS 监听地址本身（避免循环）
 func (s *Server) IsLocalAddr(ip net.IP) bool {
 	listenIP, _, _ := net.SplitHostPort(s.listenAddr)
 	return ip.String() == listenIP
 }
+
+func normalizeUpstreamTransport(transport string) string {
+	switch strings.ToLower(strings.TrimSpace(transport)) {
+	case "udp":
+		return "udp"
+	default:
+		return defaultUpstreamTransport
+	}
+}
+
+func (s *Server) preferredNetworks() []string {
+	if normalizeUpstreamTransport(s.upstreamTransport) == "udp" {
+		return []string{"udp", "tcp"}
+	}
+	return []string{"tcp", "udp"}
+}
+
+func (s *Server) exchangeUpstreamWithFallback(ctx context.Context, msg *mdns.Msg) (*mdns.Msg, string, error) {
+	networks := s.preferredNetworks()
+	lastMode := networks[len(networks)-1] + "-fallback"
+	failures := make([]string, 0, len(networks))
+
+	for index, network := range networks {
+		resp, err := s.exchangeUpstream(ctx, msg.Copy(), network)
+		mode := network
+		if index > 0 {
+			mode += "-fallback"
+		}
+		lastMode = mode
+
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("%s exchange failed: %v", network, err))
+			continue
+		}
+		if resp == nil {
+			failures = append(failures, fmt.Sprintf("%s exchange returned empty response", network))
+			continue
+		}
+		if network == "udp" && resp.Truncated {
+			failures = append(failures, fmt.Sprintf("%s exchange returned truncated response", network))
+			continue
+		}
+		return resp, mode, nil
+	}
+
+	return nil, lastMode, fmt.Errorf("%s", strings.Join(failures, "; "))
+}
+
+func (s *Server) exchangeUpstream(ctx context.Context, msg *mdns.Msg, network string) (*mdns.Msg, error) {
+	client := &mdns.Client{Net: network}
+	dialer := &net.Dialer{}
+	if s.localIP != nil {
+		if network == "tcp" {
+			dialer.LocalAddr = &net.TCPAddr{IP: s.localIP}
+		} else {
+			dialer.LocalAddr = &net.UDPAddr{IP: s.localIP}
+		}
+	}
+	if network == "udp" {
+		client.UDPSize = 1232
+	}
+	client.Dialer = dialer
+
+	resp, _, err := client.ExchangeContext(ctx, msg, s.upstream)
+	return resp, err
+}
+
