@@ -9,7 +9,7 @@ it("renders reminder actions for continuing onboarding", () => {
   render(<OnboardingReminder onContinue={onContinue} onOpenConfigFile={onOpenConfigFile} />);
 
   expect(screen.getByText(/尚未完成首次代理配置/)).toBeInTheDocument();
-  expect(screen.getByText("继续配置更推荐")).toBeInTheDocument();
+  expect(screen.getByText("待配置")).toBeInTheDocument();
 
   fireEvent.click(screen.getByRole("button", { name: "继续配置" }));
   expect(onContinue).toHaveBeenCalledTimes(1);

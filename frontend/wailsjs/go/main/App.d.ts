@@ -7,6 +7,8 @@ import {main} from '../models';
 
 export function CurrentRuntimeStatus():Promise<runtime.RuntimeStatus>;
 
+export function GetAutoStartEnabled():Promise<boolean>;
+
 export function GetBasicProxySettings():Promise<config.BasicProxySettings>;
 
 export function GetOnboardingState():Promise<config.OnboardingState>;
@@ -29,4 +31,4 @@ export function StartCore():Promise<void>;
 
 export function StopCore():Promise<void>;
 
-export function ToggleAutoStart():Promise<void>;
+export function ToggleAutoStart():Promise<boolean>;

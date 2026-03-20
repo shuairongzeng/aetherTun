@@ -1,16 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
-import { BasicProxyConfigCard } from "./components/BasicProxyConfigCard";
 import { getBackend } from "./backend";
 import { FirstRunOnboarding } from "./components/FirstRunOnboarding";
 import { OnboardingReminder } from "./components/OnboardingReminder";
-import { PrimaryActionCard } from "./components/PrimaryActionCard";
-import { QuickActionsCard } from "./components/QuickActionsCard";
-import { RecentLogsCard } from "./components/RecentLogsCard";
-import { StatusCard } from "./components/StatusCard";
+import { TabBar, type TabId } from "./components/TabBar";
 import { useBasicProxySettings } from "./hooks/useBasicProxySettings";
 import { useRuntimeState } from "./hooks/useRuntimeState";
+import { OverviewPage } from "./pages/OverviewPage";
+import { SettingsPage } from "./pages/SettingsPage";
+import { LogsPage } from "./pages/LogsPage";
 import type { BasicProxySettings, OnboardingState, SaveBasicProxySettingsResult } from "./types";
-import { getRuntimePhaseCopy } from "./components/runtimePhaseCopy";
 
 type OnboardingStep = "welcome" | "config";
 
@@ -39,36 +37,9 @@ function deriveOnboardingStateFromSettings(settings: BasicProxySettings): Onboar
   };
 }
 
-function nextStepText(phase: string, onboardingState: OnboardingState): string {
-  if (onboardingState.shouldShowOnboarding) {
-    return "先完成基础代理配置，再启动代理。";
-  }
-
-  if (phase === "running") {
-    return "代理已运行；如需切换线路，保存配置后重启。";
-  }
-
-  if (phase === "starting") {
-    return "正在等待核心上线，留意日志区的实时输出。";
-  }
-
-  if (phase === "stopping") {
-    return "等待停止完成后，再进行下一次启动。";
-  }
-
-  return "确认代理地址和端口后，点击右上角主按钮启动。";
-}
-
-function logSummaryText(phase: string): string {
-  if (phase === "running" || phase === "starting") {
-    return "日志会持续同步到界面，不再依赖外部终端窗口。";
-  }
-
-  return "启动后日志会自动开始滚动；当前可先检查配置是否正确。";
-}
-
 export default function App() {
   const backend = useMemo(() => getBackend(), []);
+  const [activeTab, setActiveTab] = useState<TabId>("overview");
   const {
     status,
     recentLogs,
@@ -78,6 +49,7 @@ export default function App() {
     stopCore,
     openConfigFile,
     openLogDirectory,
+    autoStartEnabled,
     toggleAutoStart
   } = useRuntimeState();
   const {
@@ -174,74 +146,64 @@ export default function App() {
 
   const handleSaveOnboarding = async () => {
     const result = await saveBasicProxySettings();
-    await handleProxySettingsSaved(result);
+    if (result) {
+      // 首启向导保存成功后，无论配置是否与默认值相同，
+      // 都直接关闭遮罩层进入主界面
+      setOnboardingState({
+        configExists: true,
+        isDefaultProxyConfig: false,
+        shouldShowOnboarding: false
+      });
+      setOnboardingDismissed(false);
+      setOnboardingStep("welcome");
+      await applyRestartPromptIfNeeded(result);
+    }
   };
 
   const showOnboardingOverlay = onboardingState.shouldShowOnboarding && !onboardingDismissed;
   const showOnboardingReminder = onboardingState.shouldShowOnboarding && onboardingDismissed;
-  const phaseCopy = getRuntimePhaseCopy(status.phase);
 
   return (
-    <main className="app-shell">
-      <div className="dashboard-frame">
-        <section className="dashboard-overview">
-          <StatusCard status={status} />
-          <PrimaryActionCard
-            phase={status.phase}
-            busy={busy}
-            errorText={status.lastErrorText}
-            onStart={startCore}
-            onStop={stopCore}
-          />
-        </section>
+    <>
+      <TabBar activeTab={activeTab} onTabChange={setActiveTab} statusPhase={status.phase} />
 
-        <section className="summary-strip" aria-label="概览摘要">
-          <article className="summary-chip">
-            <span className="summary-chip__label">当前阶段</span>
-            <strong className="summary-chip__value">{phaseCopy.badgeLabel}</strong>
-          </article>
-          <article className="summary-chip">
-            <span className="summary-chip__label">下一步建议</span>
-            <strong className="summary-chip__value">{nextStepText(status.phase, onboardingState)}</strong>
-          </article>
-          <article className="summary-chip">
-            <span className="summary-chip__label">日志行为</span>
-            <strong className="summary-chip__value">{logSummaryText(status.phase)}</strong>
-          </article>
-        </section>
-
+      <main className="app-shell">
         {showOnboardingReminder ? (
           <OnboardingReminder onContinue={handleResumeOnboarding} onOpenConfigFile={openConfigFile} />
         ) : null}
 
-        <section className="workspace-layout">
-          <div className="workspace-main">
-            <BasicProxyConfigCard
-              value={basicProxySettings}
-              dirty={basicProxyDirty}
-              saving={basicProxySaving}
-              errors={basicProxyErrors}
-              status={basicProxyStatus}
-              onChange={updateBasicProxyValue}
-              onSave={handleSaveBasicProxySettings}
-              onResetDefaults={resetBasicProxyDefaults}
-              onOpenConfigFile={openConfigFile}
-            />
-          </div>
+        {activeTab === "overview" ? (
+          <OverviewPage
+            status={status}
+            busy={busy}
+            autoStartEnabled={autoStartEnabled}
+            proxySettings={basicProxySettings}
+            onStart={startCore}
+            onStop={stopCore}
+            onOpenConfigFile={openConfigFile}
+            onOpenLogDirectory={openLogDirectory}
+            onToggleAutoStart={toggleAutoStart}
+          />
+        ) : null}
 
-          <aside className="workspace-side">
-            <QuickActionsCard
-              onOpenConfigFile={openConfigFile}
-              onOpenLogDirectory={openLogDirectory}
-              onToggleAutoStart={toggleAutoStart}
-            />
-          </aside>
+        {activeTab === "settings" ? (
+          <SettingsPage
+            value={basicProxySettings}
+            dirty={basicProxyDirty}
+            saving={basicProxySaving}
+            errors={basicProxyErrors}
+            status={basicProxyStatus}
+            onChange={updateBasicProxyValue}
+            onSave={handleSaveBasicProxySettings}
+            onResetDefaults={resetBasicProxyDefaults}
+            onOpenConfigFile={openConfigFile}
+          />
+        ) : null}
 
-          <div className="workspace-logs">
-            <RecentLogsCard entries={recentLogs} emptyText={logsHint} />
-          </div>
-        </section>
-      </div>
+        {activeTab === "logs" ? (
+          <LogsPage entries={recentLogs} emptyText={logsHint} onOpenLogDirectory={openLogDirectory} />
+        ) : null}
+      </main>
 
       {showOnboardingOverlay ? (
         <FirstRunOnboarding
@@ -257,6 +219,6 @@ export default function App() {
           onSave={handleSaveOnboarding}
         />
       ) : null}
-    </main>
+    </>
   );
 }

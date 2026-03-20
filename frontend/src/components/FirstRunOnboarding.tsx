@@ -22,10 +22,9 @@ export function FirstRunOnboarding(props: FirstRunOnboardingProps) {
         {props.step === "welcome" ? (
           <div className="onboarding-shell">
             <div>
-              <p className="eyebrow">首次启动引导</p>
               <h2 id="onboarding-title">欢迎使用 Aether</h2>
               <p className="onboarding-copy">
-                Aether 需要一个可用的上游代理后才能正常工作。先完成基础代理配置，再点击“启动代理”会更顺手。
+                Aether 需要一个可用的上游代理后才能正常工作。先完成基础代理配置，再点击"启动代理"会更顺手。
               </p>
 
               <div className="onboarding-checklist">
@@ -35,10 +34,10 @@ export function FirstRunOnboarding(props: FirstRunOnboardingProps) {
               </div>
 
               <div className="onboarding-actions">
-                <button className="primary-button" type="button" onClick={props.onStart}>
+                <button className="btn-primary" type="button" onClick={props.onStart}>
                   开始配置
                 </button>
-                <button className="secondary-button secondary-button--ghost" type="button" onClick={props.onSkip}>
+                <button className="btn-secondary" type="button" onClick={props.onSkip}>
                   暂时跳过
                 </button>
               </div>
@@ -57,11 +56,10 @@ export function FirstRunOnboarding(props: FirstRunOnboardingProps) {
         ) : (
           <div className="onboarding-shell">
             <div>
-              <p className="eyebrow">首次启动引导</p>
               <h2 id="onboarding-title">填写基础代理配置</h2>
               <p className="onboarding-copy">只需要填好代理地址、端口和类型，就可以回到主界面继续启动代理。</p>
 
-              <div className="config-form-grid onboarding-form-grid">
+              <div className="config-form onboarding-form-grid">
                 <label className="config-field" htmlFor="onboarding-proxy-host">
                   <span className="config-field__label">代理地址</span>
                   <span className="config-field__hint">优先填写固定的本机地址或局域网可访问地址。</span>
@@ -129,10 +127,10 @@ export function FirstRunOnboarding(props: FirstRunOnboardingProps) {
               ) : null}
 
               <div className="onboarding-actions">
-                <button className="secondary-button secondary-button--ghost" type="button" onClick={props.onBack}>
+                <button className="btn-secondary" type="button" onClick={props.onBack}>
                   返回
                 </button>
-                <button className="primary-button" type="button" onClick={() => void props.onSave()}>
+                <button className="btn-primary" type="button" onClick={() => void props.onSave()}>
                   {props.saving ? "保存中…" : "保存并进入主界面"}
                 </button>
               </div>
@@ -142,7 +140,7 @@ export function FirstRunOnboarding(props: FirstRunOnboardingProps) {
               <span className="onboarding-side__badge">推荐填写方式</span>
               <h3 className="onboarding-side__title">推荐填写方式</h3>
               <ul className="onboarding-side__list">
-                <li>如果你的上游代理跑在本机，常见地址是 `127.0.0.1`。</li>
+                <li>如果你的上游代理跑在本机，常见地址是 127.0.0.1。</li>
                 <li>端口通常与上游客户端界面里显示的监听端口一致。</li>
                 <li>协议不确定时，优先回到客户端确认是 SOCKS5 还是 HTTP。</li>
               </ul>

@@ -73,7 +73,8 @@ function buildScenarioState(scenario: PreviewScenario) {
       status: { phase: "stopped" } satisfies RuntimeStatus,
       settings: { ...defaultSettings },
       onboarding: createOnboardingState(defaultSettings),
-      logs: [] as LogEntry[]
+      logs: [] as LogEntry[],
+      autoStart: false
     };
   }
 
@@ -81,7 +82,8 @@ function buildScenarioState(scenario: PreviewScenario) {
     status: { ...runningStatus },
     settings: { ...runningSettings },
     onboarding: createOnboardingState(runningSettings),
-    logs: [...runningLogs]
+    logs: [...runningLogs],
+    autoStart: false
   };
 }
 
@@ -175,7 +177,13 @@ export function getPreviewBackend(): BackendApi | undefined {
     },
     async OpenConfigFile() {},
     async OpenLogDirectory() {},
-    async ToggleAutoStart() {}
+    async ToggleAutoStart() {
+      state.autoStart = !state.autoStart;
+      return state.autoStart;
+    },
+    async GetAutoStartEnabled() {
+      return state.autoStart;
+    }
   };
 
   scopedWindow.__aetherPreviewBackend = backend;

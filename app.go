@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"sync/atomic"
 
+	"github.com/shuairongzeng/aether/internal/autostart"
 	"github.com/shuairongzeng/aether/internal/config"
 	"github.com/shuairongzeng/aether/internal/control"
 	"github.com/shuairongzeng/aether/internal/gui"
@@ -182,8 +183,12 @@ func (a *App) OpenConfigFile() {
 	_ = exec.Command("notepad", appPaths.ConfigFile).Start()
 }
 
-func (a *App) ToggleAutoStart() error {
-	return nil
+func (a *App) ToggleAutoStart() (bool, error) {
+	return autostart.Toggle()
+}
+
+func (a *App) GetAutoStartEnabled() bool {
+	return autostart.IsEnabled()
 }
 
 func (a *App) Quit() {

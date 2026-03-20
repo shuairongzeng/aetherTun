@@ -16,12 +16,9 @@ it("renders the control shell", () => {
   render(<App />);
 
   expect(screen.getAllByText(/Aether/i).length).toBeGreaterThan(0);
-  expect(screen.getByText("运行概览")).toBeInTheDocument();
-  expect(screen.getByText("主操作")).toBeInTheDocument();
-  expect(screen.getByText("常用入口")).toBeInTheDocument();
-  expect(screen.getByText("基础代理")).toBeInTheDocument();
-  expect(screen.getByText("运行日志")).toBeInTheDocument();
-  expect(screen.getByText("下一步建议")).toBeInTheDocument();
+  expect(screen.getByRole("tab", { name: "概览" })).toBeInTheDocument();
+  expect(screen.getByRole("tab", { name: "设置" })).toBeInTheDocument();
+  expect(screen.getByRole("tab", { name: "日志" })).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "启动代理" })).toBeInTheDocument();
 });
 
@@ -30,10 +27,8 @@ it("renders preview data when the preview scenario is present", async () => {
 
   render(<App />);
 
-  expect((await screen.findAllByText("运行中")).length).toBeGreaterThan(0);
-  expect(screen.getByText("socks5://demo.aether.local:7890")).toBeInTheDocument();
+  expect((await screen.findAllByText("代理运行中")).length).toBeGreaterThan(0);
   expect(screen.getAllByText("后台核心已连接，代理正在运行。").length).toBeGreaterThan(0);
-  expect(screen.getByText("代理握手完成，TUN 路由已接管目标流量。")).toBeInTheDocument();
 });
 
 it("shows a launch error when starting the core fails", async () => {
@@ -118,6 +113,9 @@ it("shows a stopped-state hint when the core is not running and there are no log
 
   render(<App />);
 
+  // Switch to logs tab to see log hint
+  fireEvent.click(screen.getByRole("tab", { name: "日志" }));
+
   expect(await screen.findByText(/后台核心未启动/)).toBeInTheDocument();
 });
 
@@ -141,7 +139,7 @@ it("shows a running-state hint when the proxy is active but no logs have arrived
 
   render(<App />);
 
-  expect((await screen.findAllByText(/代理已运行/)).length).toBeGreaterThan(0);
+  expect((await screen.findAllByText(/代理运行中/)).length).toBeGreaterThan(0);
 });
 
 it("prompts to restart when saving while the core is running", async () => {
@@ -178,6 +176,9 @@ it("prompts to restart when saving while the core is running", async () => {
   };
 
   render(<App />);
+
+  // Switch to settings tab
+  fireEvent.click(screen.getByRole("tab", { name: "设置" }));
 
   fireEvent.change(await screen.findByLabelText(/代理端口/), { target: { value: "7890" } });
   fireEvent.click(screen.getByRole("button", { name: "保存配置" }));

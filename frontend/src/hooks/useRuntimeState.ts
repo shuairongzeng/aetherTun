@@ -43,6 +43,7 @@ export function useRuntimeState() {
   const [busy, setBusy] = useState(false);
   const [actionErrorText, setActionErrorText] = useState<string>();
   const [pendingAction, setPendingAction] = useState<PendingAction>();
+  const [autoStartEnabled, setAutoStartEnabled] = useState(false);
   const recentLogsRef = useRef<LogEntry[]>([]);
   const pendingActionRef = useRef<PendingAction>();
   const pendingTimeoutRef = useRef<number>();
@@ -206,7 +207,20 @@ export function useRuntimeState() {
   }, [backend]);
 
   const toggleAutoStart = useCallback(async () => {
-    await backend?.ToggleAutoStart?.();
+    const result = await backend?.ToggleAutoStart?.();
+    if (typeof result === "boolean") {
+      setAutoStartEnabled(result);
+    }
+  }, [backend]);
+
+  useEffect(() => {
+    async function loadAutoStart() {
+      const enabled = await backend?.GetAutoStartEnabled?.();
+      if (typeof enabled === "boolean") {
+        setAutoStartEnabled(enabled);
+      }
+    }
+    void loadAutoStart();
   }, [backend]);
 
   const resolvedStatus = useMemo(() => {
@@ -245,6 +259,7 @@ export function useRuntimeState() {
     recentLogs,
     logsHint,
     busy,
+    autoStartEnabled,
     refresh,
     startCore,
     stopCore,

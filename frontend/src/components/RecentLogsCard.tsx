@@ -104,61 +104,46 @@ export function RecentLogsCard({ entries, emptyText }: RecentLogsCardProps) {
   };
 
   return (
-    <article className="panel panel--logs">
-      <div className="panel-header">
-        <div>
-          <p className="eyebrow eyebrow--subtle">运行日志</p>
-          <h2>实时输出</h2>
-          <p className="panel-caption">核心输出会直接同步到这里，避免再弹出命令行窗口。</p>
-          <div className="log-legend-row">
-            <span className="log-legend">界面内嵌日志</span>
-            <span className="log-legend">滚轮可滚动</span>
+    <div className="log-scroller-wrap">
+      <div
+        ref={scrollerRef}
+        className="log-scroller"
+        role="log"
+        aria-live="polite"
+        aria-label="运行日志"
+        onScroll={handleScroll}
+      >
+        {entries.length === 0 ? (
+          <div className="log-empty-state">
+            <strong className="log-empty-state__title">等待新的运行日志</strong>
+            <p className="log-empty">{emptyText ?? "暂无日志"}</p>
           </div>
-        </div>
-        <span className="log-count">{entries.length} 条</span>
+        ) : (
+          <ul className="log-list">
+            {entries.map((entry, index) => (
+              <li
+                key={`${entry.time ?? "log"}-${entry.source ?? "core"}-${entry.message}-${index}`}
+                className="log-entry"
+              >
+                <div className="log-entry__meta">
+                  <span className="log-time">{formatTime(entry.time)}</span>
+                  <span className="log-source">{entry.source || "core"}</span>
+                  <span className={`log-level log-level--${entry.level || "info"}`}>
+                    {formatLevel(entry.level)}
+                  </span>
+                </div>
+                <div className="log-entry__message">{entry.message}</div>
+              </li>
+            ))}
+          </ul>
+        )}
       </div>
 
-      <div className="log-scroller-wrap">
-        <div
-          ref={scrollerRef}
-          className="log-scroller"
-          role="log"
-          aria-live="polite"
-          aria-label="运行日志"
-          onScroll={handleScroll}
-        >
-          {entries.length === 0 ? (
-            <div className="log-empty-state">
-              <strong className="log-empty-state__title">等待新的运行日志</strong>
-              <p className="log-empty">{emptyText ?? "暂无日志"}</p>
-            </div>
-          ) : (
-            <ul className="log-list">
-              {entries.map((entry, index) => (
-                <li
-                  key={`${entry.time ?? "log"}-${entry.source ?? "core"}-${entry.message}-${index}`}
-                  className="log-entry"
-                >
-                  <div className="log-entry__meta">
-                    <span className="log-time">{formatTime(entry.time)}</span>
-                    <span className="log-source">{entry.source || "core"}</span>
-                    <span className={`log-level log-level--${entry.level || "info"}`}>
-                      {formatLevel(entry.level)}
-                    </span>
-                  </div>
-                  <div className="log-entry__message">{entry.message}</div>
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
-
-        {showJumpButton ? (
-          <button className="log-jump-button" type="button" onClick={handleJumpToBottom}>
-            回到底部
-          </button>
-        ) : null}
-      </div>
-    </article>
+      {showJumpButton ? (
+        <button className="log-jump-button" type="button" onClick={handleJumpToBottom}>
+          ↓ 回到最新
+        </button>
+      ) : null}
+    </div>
   );
 }

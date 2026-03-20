@@ -1,57 +1,59 @@
 type QuickActionsCardProps = {
+  autoStartEnabled: boolean;
   onOpenConfigFile: () => Promise<void>;
   onOpenLogDirectory: () => Promise<void>;
   onToggleAutoStart: () => Promise<void>;
 };
 
-type QuickActionItemProps = {
+type ActionItem = {
+  icon: string;
   label: string;
-  description: string;
+  hint: string;
   onClick: () => Promise<void>;
 };
 
-function QuickActionItem(props: QuickActionItemProps) {
-  return (
-    <div className="quick-action">
-      <div className="quick-action__body">
-        <strong className="quick-action__title">{props.label}</strong>
-        <p className="quick-action__description">{props.description}</p>
-      </div>
-      <button className="secondary-button secondary-button--compact" type="button" onClick={() => void props.onClick()}>
-        {props.label}
-      </button>
-    </div>
-  );
-}
-
 export function QuickActionsCard(props: QuickActionsCardProps) {
-  return (
-    <article className="panel quick-actions-card">
-      <div className="panel-header">
-        <div>
-          <p className="eyebrow eyebrow--subtle">常用入口</p>
-          <h2>辅助操作</h2>
-          <p className="panel-caption">把排障、配置和后续扩展入口收拢到一个固定区域。</p>
-        </div>
-      </div>
+  const actions: ActionItem[] = [
+    {
+      icon: "📂",
+      label: "打开配置文件",
+      hint: "快速编辑高级配置",
+      onClick: props.onOpenConfigFile
+    },
+    {
+      icon: "📋",
+      label: "查看日志目录",
+      hint: "定位日志文件排查问题",
+      onClick: props.onOpenLogDirectory
+    },
+    {
+      icon: props.autoStartEnabled ? "✅" : "🔄",
+      label: "开机自启",
+      hint: props.autoStartEnabled ? "已启用，点击关闭" : "未启用，点击开启",
+      onClick: props.onToggleAutoStart
+    }
+  ];
 
+  return (
+    <div className="card quick-actions-card">
+      <h3 className="quick-actions-card__title">快捷操作</h3>
       <div className="quick-actions">
-        <QuickActionItem
-          label="打开配置文件"
-          description="快速打开真实配置文件进行高级编辑。"
-          onClick={props.onOpenConfigFile}
-        />
-        <QuickActionItem
-          label="查看日志"
-          description="直接跳到日志目录，便于排查问题。"
-          onClick={props.onOpenLogDirectory}
-        />
-        <QuickActionItem
-          label="开机自启"
-          description="预留开机自启入口，后续会接入系统注册。"
-          onClick={props.onToggleAutoStart}
-        />
+        {actions.map((action) => (
+          <button
+            key={action.label}
+            className="quick-action"
+            type="button"
+            onClick={() => void action.onClick()}
+          >
+            <span className="quick-action__icon">{action.icon}</span>
+            <span className="quick-action__text">
+              <span className="quick-action__label">{action.label}</span>
+              <span className="quick-action__hint">{action.hint}</span>
+            </span>
+            <span className="quick-action__chevron">→</span>
+          </button>
+        ))}
       </div>
-    </article>
+    </div>
   );
 }

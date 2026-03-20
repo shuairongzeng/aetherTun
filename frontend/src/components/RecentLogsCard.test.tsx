@@ -48,8 +48,6 @@ it("sticks to the bottom when new logs arrive and the user is already at the bot
   measurements.scrollHeight = 320;
   rerender(<RecentLogsCard entries={nextEntries} />);
 
-  expect(screen.getByText("界面内嵌日志")).toBeInTheDocument();
-  expect(screen.getByText("滚轮可滚动")).toBeInTheDocument();
   expect(scroller.scrollTop).toBe(220);
 });
 
@@ -80,7 +78,7 @@ it("shows a jump button when the user scrolls away from the bottom", () => {
 
   fireEvent.scroll(scroller);
 
-  expect(screen.getByRole("button", { name: "回到底部" })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /回到最新/ })).toBeInTheDocument();
 });
 
 it("scrolls back to the bottom and hides the jump button after clicking it", () => {
@@ -92,10 +90,10 @@ it("scrolls back to the bottom and hides the jump button after clicking it", () 
   configureScroller(scroller, measurements);
 
   fireEvent.scroll(scroller);
-  fireEvent.click(screen.getByRole("button", { name: "回到底部" }));
+  fireEvent.click(screen.getByRole("button", { name: /回到最新/ }));
 
   expect(scroller.scrollTop).toBe(220);
-  expect(screen.queryByRole("button", { name: "回到底部" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /回到最新/ })).not.toBeInTheDocument();
 });
 
 it("renders a stronger empty state when there are no log entries", () => {

@@ -6,6 +6,10 @@ export function CurrentRuntimeStatus() {
   return window['go']['main']['App']['CurrentRuntimeStatus']();
 }
 
+export function GetAutoStartEnabled() {
+  return window['go']['main']['App']['GetAutoStartEnabled']();
+}
+
 export function GetBasicProxySettings() {
   return window['go']['main']['App']['GetBasicProxySettings']();
 }

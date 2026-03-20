@@ -8,28 +8,20 @@ type PrimaryActionCardProps = {
   onStop: () => Promise<void>;
 };
 
-function helperText(phase: string, errorText?: string): string {
-  if (errorText) {
-    return errorText;
-  }
-
-  return getRuntimePhaseCopy(phase).actionText;
-}
-
 function actionHints(phase: string): string[] {
   if (phase === "running") {
     return ["如需切换代理地址，先保存配置再重启。", "关闭窗口后仍可从托盘继续停止或打开主界面。"];
   }
 
   if (phase === "starting") {
-    return ["启动后即可在右侧日志区查看实时输出。", "如长时间无响应，请稍后重试或检查 UAC 提示。"];
+    return ["启动后即可在日志页查看实时输出。", "如长时间无响应，请稍后重试或检查 UAC 提示。"];
   }
 
   if (phase === "stopping") {
-    return ["正在等待后台核心退出。", "停止完成前，日志区仍会继续显示最后一批输出。"];
+    return ["正在等待后台核心退出。", "停止完成前，日志页仍会继续显示最后一批输出。"];
   }
 
-  return ["启动后即可在右侧日志区查看实时输出。", "首次使用建议先确认基础代理地址、端口和类型。"];
+  return ["启动后即可在日志页查看实时输出。", "首次使用建议先确认基础代理地址、端口和类型。"];
 }
 
 function actionCapabilities(phase: string): string[] {
@@ -57,6 +49,7 @@ export function PrimaryActionCard({
 }: PrimaryActionCardProps) {
   const isDisabled = busy || phase === "starting" || phase === "stopping";
   const phaseCopy = getRuntimePhaseCopy(phase);
+  const isDanger = phase === "running";
 
   const handleClick = async () => {
     if (isDisabled) {
@@ -72,17 +65,9 @@ export function PrimaryActionCard({
   };
 
   return (
-    <section className="panel primary-action-card">
-      <div className="panel-header">
-        <div>
-          <p className="eyebrow eyebrow--subtle">主操作</p>
-          <h2>{phase === "running" ? "代理已启动" : "准备启动代理"}</h2>
-          <p className="panel-caption">{helperText(phase, errorText)}</p>
-        </div>
-      </div>
-
+    <div className="primary-action-wrapper">
       <button
-        className={`primary-button primary-button--wide${isDisabled ? " primary-button--disabled" : ""}`}
+        className={`btn-primary${isDanger ? " btn-primary--danger" : ""}`}
         type="button"
         onClick={() => void handleClick()}
         disabled={isDisabled}
@@ -90,6 +75,7 @@ export function PrimaryActionCard({
       >
         {phaseCopy.buttonLabel}
       </button>
+      {errorText ? <p className="error-text">{errorText}</p> : null}
 
       <div className="action-capabilities" aria-label="操作能力">
         {actionCapabilities(phase).map((item) => (
@@ -104,6 +90,6 @@ export function PrimaryActionCard({
           <li key={hint}>{hint}</li>
         ))}
       </ul>
-    </section>
+    </div>
   );
 }

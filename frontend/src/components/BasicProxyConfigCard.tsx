@@ -30,43 +30,36 @@ function statusTitle(tone: BasicProxyStatus["tone"]) {
 export function BasicProxyConfigCard(props: BasicProxyConfigCardProps) {
   const saveDisabled = !props.dirty || props.saving || hasErrors(props.errors);
   const endpointLabel = `${props.value.host}:${props.value.port}`;
-  const formStateLabel = props.dirty ? "已修改，等待保存" : "已与当前表单同步";
 
   return (
-    <article className="panel config-card">
-      <div className="panel-header">
-        <div>
-          <p className="eyebrow eyebrow--subtle">基础代理</p>
-          <h2>连接参数</h2>
-          <p className="panel-caption">直接修改上游代理地址、端口和类型，新手无需手动编辑配置文件。</p>
-        </div>
+    <div className="card config-card">
+      <div className="config-card__header">
+        <h2 className="config-card__title">代理配置</h2>
+        <span className={`config-card__badge config-card__badge--${props.dirty ? "dirty" : "clean"}`}>
+          {props.dirty ? "有未保存修改" : "已保存"}
+        </span>
       </div>
 
       <div className="config-overview">
-        <article className="config-overview__item">
+        <div className="config-overview__item">
           <span className="config-overview__label">当前上游</span>
           <strong className="config-overview__value">{endpointLabel}</strong>
-        </article>
-        <article className="config-overview__item">
+        </div>
+        <div className="config-overview__item">
           <span className="config-overview__label">协议</span>
           <strong className="config-overview__value">{props.value.type.toUpperCase()}</strong>
-        </article>
-        <article className="config-overview__item">
-          <span className="config-overview__label">表单状态</span>
-          <strong className="config-overview__value">{formStateLabel}</strong>
-        </article>
+        </div>
       </div>
 
-      <p className="config-inline-tip">保存后会写入正式配置文件；代理运行中修改时会提示是否立即重启。</p>
-
-      <div className="config-form-grid">
+      <div className="config-form">
         <label className="config-field" htmlFor="proxy-host">
           <span className="config-field__label">代理地址</span>
-          <span className="config-field__hint">支持 IP、localhost 或局域网域名。</span>
+          <span className="config-field__hint">支持 IP、localhost 或局域网域名</span>
           <input
             id="proxy-host"
             className="config-input"
             type="text"
+            placeholder="127.0.0.1"
             value={props.value.host}
             onChange={(event) =>
               props.onChange({
@@ -80,13 +73,14 @@ export function BasicProxyConfigCard(props: BasicProxyConfigCardProps) {
 
         <label className="config-field" htmlFor="proxy-port">
           <span className="config-field__label">代理端口</span>
-          <span className="config-field__hint">请填写 1-65535 范围内的监听端口。</span>
+          <span className="config-field__hint">请填写 1-65535 范围内的端口</span>
           <input
             id="proxy-port"
             className="config-input"
             type="number"
             min={1}
             max={65535}
+            placeholder="10808"
             value={props.value.port}
             onChange={(event) =>
               props.onChange({
@@ -100,7 +94,7 @@ export function BasicProxyConfigCard(props: BasicProxyConfigCardProps) {
 
         <label className="config-field" htmlFor="proxy-type">
           <span className="config-field__label">代理类型</span>
-          <span className="config-field__hint">优先选择与上游客户端一致的协议类型。</span>
+          <span className="config-field__hint">选择与上游客户端一致的协议类型</span>
           <select
             id="proxy-type"
             className="config-input"
@@ -130,33 +124,32 @@ export function BasicProxyConfigCard(props: BasicProxyConfigCardProps) {
         </div>
       ) : null}
 
-      <div className="config-footer">
-        <p className="config-footer__note">运行中修改配置时，界面会提示是否立即重启代理。</p>
+      <div className="config-actions">
+        <button
+          className="btn-primary config-actions__primary"
+          type="button"
+          disabled={saveDisabled}
+          onClick={() => void props.onSave()}
+        >
+          {props.saving ? "保存中…" : "保存配置"}
+        </button>
 
-        <div className="config-actions">
-          <button
-            className="primary-button config-actions__primary"
-            type="button"
-            disabled={saveDisabled}
-            onClick={() => void props.onSave()}
-          >
-            {props.saving ? "保存中…" : "保存配置"}
+        <div className="config-actions__secondary">
+          <button className="btn-secondary" type="button" onClick={() => void props.onResetDefaults()}>
+            恢复默认值
           </button>
-
-          <div className="config-actions__secondary">
-            <button className="secondary-button" type="button" onClick={() => void props.onResetDefaults()}>
-              恢复默认值
-            </button>
-            <button
-              className="secondary-button secondary-button--ghost"
-              type="button"
-              onClick={() => void props.onOpenConfigFile()}
-            >
-              打开配置文件
-            </button>
-          </div>
         </div>
       </div>
-    </article>
+
+      <div className="config-footer">
+        <p className="config-footer__note">运行中修改配置时，界面会提示是否立即重启代理。</p>
+        <p className="config-footer__link">
+          需要修改高级网络配置？{" "}
+          <button type="button" onClick={() => void props.onOpenConfigFile()}>
+            打开配置文件 →
+          </button>
+        </p>
+      </div>
+    </div>
   );
 }

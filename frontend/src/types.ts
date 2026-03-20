@@ -51,5 +51,6 @@ export type BackendApi = {
   GetOnboardingState?: () => Promise<OnboardingState | Record<string, unknown>>;
   OpenConfigFile?: () => Promise<void>;
   OpenLogDirectory?: () => Promise<void>;
-  ToggleAutoStart?: () => Promise<void>;
+  ToggleAutoStart?: () => Promise<boolean>;
+  GetAutoStartEnabled?: () => Promise<boolean>;
 };

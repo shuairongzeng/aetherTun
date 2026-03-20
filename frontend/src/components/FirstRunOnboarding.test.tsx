@@ -23,6 +23,8 @@ it("renders the welcome step with start and skip actions", () => {
   expect(screen.getByText("保存后就能回到主界面继续启动代理")).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "开始配置" })).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "暂时跳过" })).toBeInTheDocument();
+  expect(screen.getByText("推荐先完成配置")).toBeInTheDocument();
+  expect(screen.getByText("你将得到什么")).toBeInTheDocument();
 });
 
 it("renders the config step and submits save action", () => {

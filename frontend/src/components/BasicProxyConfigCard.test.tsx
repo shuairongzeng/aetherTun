@@ -10,13 +10,15 @@ it("disables save until the form becomes dirty and valid", () => {
       saving={false}
       errors={{}}
       status={{ tone: "info", text: "" }}
-      onChange={() => {}}
-      onSave={() => {}}
-      onResetDefaults={() => {}}
+      onChange={() => { }}
+      onSave={() => { }}
+      onResetDefaults={() => { }}
       onOpenConfigFile={vi.fn().mockResolvedValue(undefined)}
     />
   );
 
+  expect(screen.getByText("代理配置")).toBeInTheDocument();
+  expect(screen.getByText("已保存")).toBeInTheDocument();
   expect(screen.getByText("当前上游")).toBeInTheDocument();
   expect(screen.getByText("127.0.0.1:10808")).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "保存配置" })).toBeDisabled();
@@ -30,9 +32,9 @@ it("shows inline validation text", () => {
       saving={false}
       errors={{ host: "代理地址不能为空" }}
       status={{ tone: "info", text: "" }}
-      onChange={() => {}}
-      onSave={() => {}}
-      onResetDefaults={() => {}}
+      onChange={() => { }}
+      onSave={() => { }}
+      onResetDefaults={() => { }}
       onOpenConfigFile={vi.fn().mockResolvedValue(undefined)}
     />
   );
@@ -48,9 +50,9 @@ it("renders a success banner when config is saved", () => {
       saving={false}
       errors={{}}
       status={{ tone: "success", text: "配置已保存。" }}
-      onChange={() => {}}
-      onSave={() => {}}
-      onResetDefaults={() => {}}
+      onChange={() => { }}
+      onSave={() => { }}
+      onResetDefaults={() => { }}
       onOpenConfigFile={vi.fn().mockResolvedValue(undefined)}
     />
   );
@@ -69,9 +71,9 @@ it("renders an error banner when saving fails", () => {
       saving={false}
       errors={{}}
       status={{ tone: "error", text: "保存配置失败，请检查配置文件后重试。" }}
-      onChange={() => {}}
-      onSave={() => {}}
-      onResetDefaults={() => {}}
+      onChange={() => { }}
+      onSave={() => { }}
+      onResetDefaults={() => { }}
       onOpenConfigFile={vi.fn().mockResolvedValue(undefined)}
     />
   );
